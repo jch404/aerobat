@@ -27,22 +27,24 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 import torch
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
+from safetensors.torch import load_file as load_safetensors_file
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.datasets.utils import load_episodes_stats, load_stats
+from lerobot.datasets.utils import EPISODES_STATS_PATH, STATS_PATH, load_episodes_stats, load_stats, unflatten_dict
 from lerobot.policies.factory import get_policy_class
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.utils import get_safe_torch_device
 from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig
 from lerobot.robots.so101_follower.so101_follower import SO101Follower
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 DEFAULT_POLICY_PATH = Path(
     "/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model"
@@ -254,6 +256,154 @@ def load_dataset_stats_from_root(dataset_root: str | None) -> dict | None:
         return None
 
 
+def load_stats_file(stats_path: Path) -> dict | None:
+    if not stats_path.exists():
+        return None
+
+    if stats_path.suffix == ".json":
+        try:
+            with open(stats_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            logging.warning("Failed to load JSON stats from %s: %s", stats_path, exc)
+        return None
+
+    if stats_path.suffix == ".safetensors":
+        try:
+            tensors = load_safetensors_file(str(stats_path))
+            return unflatten_dict({key: tensor for key, tensor in tensors.items()})
+        except Exception as exc:
+            logging.warning("Failed to load safetensors stats from %s: %s", stats_path, exc)
+        return None
+
+    if stats_path.suffix == ".npz":
+        try:
+            data = np.load(stats_path, allow_pickle=True)
+            return {key: data[key] for key in data.files}
+        except Exception as exc:
+            logging.warning("Failed to load NPZ stats from %s: %s", stats_path, exc)
+        return None
+
+    return None
+
+
+def find_stats_in_directory(directory: Path) -> Path | None:
+    candidates = [
+        directory / "meta" / "stats.json",
+        directory / "meta" / "episodes_stats.jsonl",
+        directory / "meta_data" / "stats.safetensors",
+        directory / "stats.safetensors",
+        directory / "stats.json",
+        directory / "meta" / "stats.safetensors",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def auto_find_dataset_root(policy_path: Path) -> str | None:
+    for candidate_root in [policy_path, policy_path.parent, policy_path.parent.parent, Path.cwd()]:
+        stats_file = find_stats_in_directory(candidate_root)
+        if stats_file is not None:
+            return str(candidate_root)
+    return None
+
+
+def create_identity_stats(config: PreTrainedConfig, stats: dict | None = None) -> dict:
+    stats = {} if stats is None else dict(stats)
+    for feature_map in (config.input_features, config.output_features):
+        for key, ft in feature_map.items():
+            if key in stats:
+                continue
+            norm_mode = config.normalization_mapping.get(ft.type, NormalizationMode.IDENTITY)
+            if norm_mode is NormalizationMode.IDENTITY:
+                continue
+
+            shape = tuple(ft.shape)
+            if ft.type is FeatureType.VISUAL:
+                shape = (shape[0], 1, 1)
+
+            if norm_mode is NormalizationMode.MEAN_STD:
+                stats[key] = {
+                    "mean": np.zeros(shape, dtype=np.float32),
+                    "std": np.ones(shape, dtype=np.float32),
+                }
+            elif norm_mode is NormalizationMode.MIN_MAX:
+                stats[key] = {
+                    "min": np.zeros(shape, dtype=np.float32),
+                    "max": np.ones(shape, dtype=np.float32),
+                }
+    return stats
+
+
+
+def repair_missing_normalization_buffers(policy) -> None:
+    """Replace inf/nan normalization buffers with safe identity values.
+
+    This is a Jetson/inference safety fallback. Some old LeRobot checkpoints do
+    not include dataset normalization buffers in model.safetensors, and newer
+    LeRobot versions initialize those missing buffers with inf. ACT then crashes
+    at normalize.py with: AssertionError: `mean` is infinity.
+
+    Safe fallback:
+    - mean/min -> 0
+    - std/max  -> 1
+
+    This may reduce policy quality if the real dataset stats are missing, but it
+    allows inference to run and confirms the hardware/action path.
+    """
+    repaired = []
+
+    for module_name, module in policy.named_modules():
+        for buffer_name, buffer in module.named_buffers(recurse=False):
+            if not torch.is_tensor(buffer):
+                continue
+
+            bad = torch.isnan(buffer).any() or torch.isinf(buffer).any()
+            if not bad:
+                continue
+
+            lowered = buffer_name.lower()
+            if "std" in lowered or "max" in lowered:
+                fill_value = 1.0
+            else:
+                fill_value = 0.0
+
+            with torch.no_grad():
+                buffer.data = torch.full_like(buffer, fill_value)
+
+            full_name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+            repaired.append(f"{full_name}={fill_value}")
+
+    if repaired:
+        logging.warning(
+            "Repaired missing/invalid normalization buffers with identity fallback: %s",
+            ", ".join(repaired),
+        )
+    else:
+        logging.info("Normalization buffers look valid; no repair needed.")
+
+
+def print_policy_normalization_status(policy) -> None:
+    bad_buffers = []
+    for module_name, module in policy.named_modules():
+        for buffer_name, buffer in module.named_buffers(recurse=False):
+            if not torch.is_tensor(buffer):
+                continue
+            if torch.isnan(buffer).any() or torch.isinf(buffer).any():
+                full_name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+                bad_buffers.append(full_name)
+
+    if bad_buffers:
+        logging.warning("Still invalid normalization buffers: %s", ", ".join(bad_buffers))
+    else:
+        logging.info("All normalization buffers are finite.")
+
+
+
 def load_dataset_stats(policy_path: Path, dataset_repo_id: str | None, dataset_root: str | None) -> dict | None:
     """Load dataset normalization stats from train_config.json or explicit dataset metadata."""
     train_config_path = find_train_config_path(policy_path)
@@ -288,7 +438,16 @@ def load_dataset_stats(policy_path: Path, dataset_repo_id: str | None, dataset_r
         return ds_meta.stats
     except Exception as exc:
         logging.warning("Failed to load dataset metadata for normalization stats from repo_id=%s root=%s: %s", dataset_repo_id, dataset_root, exc)
-        return None
+
+    for candidate_root in [policy_path, policy_path.parent, policy_path.parent.parent]:
+        stats_file = find_stats_in_directory(candidate_root)
+        if stats_file is not None:
+            stats = load_stats_file(stats_file)
+            if stats is not None:
+                logging.info("Loaded normalization stats from checkpoint directory %s", stats_file)
+                return stats
+
+    return None
 
 
 def parse_camera_mapping(args: argparse.Namespace) -> dict[str, int]:
@@ -458,11 +617,22 @@ def main() -> int:
     dataset_stats = load_dataset_stats(policy_path, args.dataset_repo_id, args.dataset_root)
     if dataset_stats is None:
         logging.warning(
-            "Dataset normalization stats were not loaded. Policy normalization may fail if stats are missing from model weights."
+            "Dataset normalization stats were not loaded. Falling back to identity stats for any missing normalization features."
         )
+        dataset_stats = create_identity_stats(policy_cfg)
+    else:
+        dataset_stats = create_identity_stats(policy_cfg, dataset_stats)
 
     policy_cls = get_policy_class(policy_cfg.type)
     policy = policy_cls.from_pretrained(policy_path, config=policy_cfg, dataset_stats=dataset_stats)
+
+    # Important fallback for old/incompatible checkpoints:
+    # Even when dataset_stats is provided, some LeRobot versions keep missing
+    # normalizer buffers as inf after loading model.safetensors. Repair them
+    # before the first policy.select_action() call.
+    repair_missing_normalization_buffers(policy)
+    print_policy_normalization_status(policy)
+
     policy.reset()
 
     logging.info("Loaded pretrained policy '%s'", policy_cfg.type)
