@@ -1,33 +1,38 @@
-아래 명령어들을 Jetson에서 그대로 실행하세요.
+=## 실행 명령어
 
 ```bash
-cd /home/user/project/lerobot
-
-# 실시간 로그(버퍼 없이)로 실행 (front=2, top=0, fps=30)
-python3 -u examples/run_act_inference_jetson_fixed.py \
+python3 examples/run_act_inference_jetson_fixed.py \
   --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
   --robot-port /dev/ttyACM0 \
-  --robot-id my_follower \
   --camera-config front=2 \
   --camera-config top=0 \
-  --device cuda \
-  --use-amp \
   --camera-width 640 \
   --camera-height 480 \
-  --camera-fps 30
+  --camera-fps 30 \
+  --device cuda \
+  --task test \
+  --steps 0
 ```
 
-문제 진단용(카메라 인덱스 자동 감지):
+### normalization stats 자동 로드가 필요한 경우
+`train_config.json`이 policy 경로 상위에 있으면 자동으로 시도합니다.
+
+명시적으로 dataset metadata를 지정하려면:
+
 ```bash
-python3 -u examples/run_act_inference_jetson_fixed.py --detect-cameras
+python3 examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --camera-config front=2 \
+  --camera-config top=0 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task test \
+  --steps 0 \
+  --dataset-repo-id <dataset_repo_id> \
+  --dataset-root /path/to/local/dataset
 ```
 
-백그라운드 실행(예: `tmux`나 `nohup` 사용):
-```bash
-nohup python3 examples/run_act_inference_jetson_fixed.py ... > run.log 2>&1 &
-# 또는 tmux 세션 생성 후 실행
-tmux new -s act_run
-# (세션 안에서 앞의 python 명령 실행)
-```
-
-충돌 또는 오류가 나오면 콘솔 출력 전체를 붙여넣어 주세요.
+> `--steps 0`은 중단할 때까지 계속 실행하는 옵션입니다.

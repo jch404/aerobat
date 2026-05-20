@@ -33,7 +33,9 @@ except ImportError:
     cv2 = None
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.train import TrainPipelineConfig
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.policies.factory import get_policy_class
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.utils import get_safe_torch_device
@@ -127,6 +129,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Probe OpenCV camera indices 0..5 and print available cameras.",
     )
+    parser.add_argument(
+        "--dataset-repo-id",
+        default=None,
+        help=(
+            "Optional dataset repo id to load normalization stats from. "
+            "If omitted, the runner will try to infer the dataset from train_config.json."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default=None,
+        help=(
+            "Optional local dataset root path to load dataset metadata and normalization stats. "
+            "If omitted, the dataset root from train_config.json will be used when available."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -164,6 +182,57 @@ def validate_paths(policy_path: Path, robot_port: str) -> None:
 
     if not Path(robot_port).exists():
         raise FileNotFoundError(f"Robot port not found: {robot_port}")
+
+
+def find_train_config_path(policy_path: Path) -> Path | None:
+    for candidate in [
+        policy_path / "train_config.json",
+        policy_path.parent / "train_config.json",
+        policy_path.parent.parent / "train_config.json",
+    ]:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_dataset_stats(policy_path: Path, dataset_repo_id: str | None, dataset_root: str | None) -> dict | None:
+    """Load dataset normalization stats from train_config.json or explicit dataset metadata."""
+    train_cfg = None
+    train_config_path = find_train_config_path(policy_path)
+    if train_config_path is not None:
+        try:
+            logging.info("Found train_config.json at %s", train_config_path)
+            train_cfg = TrainPipelineConfig.from_pretrained(train_config_path)
+        except Exception as exc:
+            logging.warning("Failed to parse train_config.json from %s: %s", train_config_path, exc)
+
+    if train_cfg is None and dataset_repo_id is None and dataset_root is None:
+        logging.info("No train configuration or dataset metadata provided; dataset stats will not be loaded.")
+        return None
+
+    if train_cfg is not None:
+        if dataset_repo_id:
+            train_cfg.dataset.repo_id = dataset_repo_id
+        if dataset_root:
+            train_cfg.dataset.root = dataset_root
+        dataset_repo_id = train_cfg.dataset.repo_id
+        dataset_root = train_cfg.dataset.root
+    elif dataset_repo_id is None:
+        logging.info("Dataset repo id must be provided if train_config.json is unavailable.")
+        return None
+
+    try:
+        ds_meta = LeRobotDatasetMetadata(repo_id=dataset_repo_id, root=dataset_root)
+        logging.info(
+            "Loaded dataset metadata from repo_id=%s root=%s revision=%s",
+            ds_meta.repo_id,
+            ds_meta.root,
+            ds_meta.revision,
+        )
+        return ds_meta.stats
+    except Exception as exc:
+        logging.warning("Failed to load dataset metadata for normalization stats: %s", exc)
+        return None
 
 
 def parse_camera_mapping(args: argparse.Namespace) -> dict[str, int]:
@@ -330,8 +399,14 @@ def main() -> int:
         logging.warning("Automatic mixed precision requested but only available on CUDA. Disabling AMP.")
         policy_cfg.use_amp = False
 
+    dataset_stats = load_dataset_stats(policy_path, args.dataset_repo_id, args.dataset_root)
+    if dataset_stats is None:
+        logging.warning(
+            "Dataset normalization stats were not loaded. Policy normalization may fail if stats are missing from model weights."
+        )
+
     policy_cls = get_policy_class(policy_cfg.type)
-    policy = policy_cls.from_pretrained(policy_path, config=policy_cfg)
+    policy = policy_cls.from_pretrained(policy_path, config=policy_cfg, dataset_stats=dataset_stats)
     policy.reset()
 
     logging.info("Loaded pretrained policy '%s'", policy_cfg.type)
