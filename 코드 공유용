@@ -1,4 +1,4 @@
-cd /Users/sslab/workspace/aerobat
+cd /home/user/project/lerobot
 python3 examples/run_act_inference_jetson_fixed.py \
   --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
   --robot-port /dev/ttyACM0 \
