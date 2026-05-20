@@ -118,6 +118,26 @@ def parse_args() -> argparse.Namespace:
         help="Max relative target for safety when sending joint goals.",
     )
     parser.add_argument(
+        "--action-scale",
+        type=float,
+        default=1.0,
+        help="Scale policy actions before sending them to the robot. Use values like 0.3 for cautious tests.",
+    )
+    parser.add_argument(
+        "--invert-action-all",
+        action="store_true",
+        help="Invert the sign of every action dimension before sending it to the robot.",
+    )
+    parser.add_argument(
+        "--invert-action",
+        action="append",
+        default=[],
+        help=(
+            "Invert selected action keys. Accepts motor names with or without .pos, "
+            "and comma-separated values. Example: --invert-action shoulder_pan,elbow_flex"
+        ),
+    )
+    parser.add_argument(
         "--use-degrees",
         action="store_true",
         help="Use degrees for motor position normalization if the dataset/policy was trained that way.",
@@ -547,13 +567,58 @@ def build_observation_frame(observation: dict[str, np.ndarray], robot: SO101Foll
     return frame
 
 
-def build_action_dict(action_tensor: torch.Tensor, robot: SO101Follower) -> dict[str, float]:
+def parse_action_keys(raw_values: list[str], action_keys: list[str]) -> set[str]:
+    requested = []
+    for raw_value in raw_values:
+        requested.extend(part.strip() for part in raw_value.split(","))
+
+    key_lookup = {key: key for key in action_keys}
+    key_lookup.update({key.removesuffix(".pos"): key for key in action_keys})
+
+    selected = set()
+    unknown = []
+    for name in requested:
+        if not name:
+            continue
+        key = key_lookup.get(name)
+        if key is None:
+            unknown.append(name)
+        else:
+            selected.add(key)
+
+    if unknown:
+        raise ValueError(
+            "Unknown --invert-action key(s): "
+            + ", ".join(unknown)
+            + ". Available action keys: "
+            + ", ".join(action_keys)
+        )
+    return selected
+
+
+def build_action_dict(
+    action_tensor: torch.Tensor,
+    robot: SO101Follower,
+    action_scale: float = 1.0,
+    invert_action_all: bool = False,
+    invert_action_keys: set[str] | None = None,
+) -> dict[str, float]:
     action_values = action_tensor.cpu().numpy().astype(np.float32).reshape(-1)
     action_keys = list(robot.action_features)
     if len(action_values) != len(action_keys):
         raise ValueError(
             f"Expected action dimension {len(action_keys)}, but policy output has shape {action_values.shape}."
         )
+
+    invert_action_keys = set() if invert_action_keys is None else invert_action_keys
+    signs = np.array(
+        [
+            -1.0 if invert_action_all or key in invert_action_keys else 1.0
+            for key in action_keys
+        ],
+        dtype=np.float32,
+    )
+    action_values = action_values * signs * action_scale
     return {key: float(value) for key, value in zip(action_keys, action_values)}
 
 
@@ -581,8 +646,14 @@ def main() -> int:
     logging.info("  device=%s", args.device)
     logging.info("  use_amp=%s", args.use_amp)
     logging.info("  task=%s", args.task)
+    logging.info("  action_scale=%s", args.action_scale)
+    logging.info("  invert_action_all=%s", args.invert_action_all)
+    logging.info("  invert_action=%s", args.invert_action)
     logging.info("  steps=%s", args.steps)
     logging.info("  detect_cameras=%s", args.detect_cameras)
+
+    if args.action_scale <= 0:
+        raise ValueError("--action-scale must be greater than 0.")
 
     if args.detect_cameras:
         available = detect_connected_cameras()
@@ -664,6 +735,15 @@ def main() -> int:
         use_degrees=args.use_degrees,
     )
     robot = SO101Follower(robot_cfg)
+    action_keys = list(robot.action_features)
+    invert_action_keys = parse_action_keys(args.invert_action, action_keys)
+    logging.info("Robot action keys: %s", action_keys)
+    logging.info(
+        "Action transform: scale=%s invert_all=%s invert_keys=%s",
+        args.action_scale,
+        args.invert_action_all,
+        sorted(invert_action_keys),
+    )
 
     logging.info("Connecting robot on port %s", args.robot_port)
     try:
@@ -687,7 +767,13 @@ def main() -> int:
                 task=args.task,
                 robot_type=robot.robot_type,
             )
-            action_dict = build_action_dict(action_tensor, robot)
+            action_dict = build_action_dict(
+                action_tensor,
+                robot,
+                action_scale=args.action_scale,
+                invert_action_all=args.invert_action_all,
+                invert_action_keys=invert_action_keys,
+            )
             sent_action = robot.send_action(action_dict)
             logging.info("Step %s action=%s", step, sent_action)
             step += 1

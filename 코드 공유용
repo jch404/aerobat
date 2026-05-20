@@ -1,12 +1,6 @@
 python3 examples/run_act_inference_jetson_fixed.py \
-  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
-  --robot-port /dev/ttyACM0 \
   --camera-config front=2 \
   --camera-config top=0 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --camera-fps 30 \
-  --device cuda \
-  --task test \
-  --steps 0 \
-  --dataset-root /path/to/local/dataset
+  --invert-action-all \
+  --action-scale 0.3 \
+  --steps 10

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import numpy as np
 import torch
 from torch import Tensor, nn
@@ -167,14 +168,22 @@ class Normalize(nn.Module):
             if norm_mode is NormalizationMode.MEAN_STD:
                 mean = buffer["mean"]
                 std = buffer["std"]
-                assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
-                assert not torch.isinf(std).any(), _no_stats_error_str("std")
+                if torch.isinf(mean).any() or torch.isinf(std).any():
+                    logging.warning(
+                        "Missing normalization stats for '%s'. Skipping mean/std normalization for this feature.",
+                        key,
+                    )
+                    continue
                 batch[key] = (batch[key] - mean) / (std + 1e-8)
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min = buffer["min"]
                 max = buffer["max"]
-                assert not torch.isinf(min).any(), _no_stats_error_str("min")
-                assert not torch.isinf(max).any(), _no_stats_error_str("max")
+                if torch.isinf(min).any() or torch.isinf(max).any():
+                    logging.warning(
+                        "Missing normalization stats for '%s'. Skipping min/max normalization for this feature.",
+                        key,
+                    )
+                    continue
                 # normalize to [0,1]
                 batch[key] = (batch[key] - min) / (max - min + 1e-8)
                 # normalize to [-1, 1]
@@ -240,14 +249,22 @@ class Unnormalize(nn.Module):
             if norm_mode is NormalizationMode.MEAN_STD:
                 mean = buffer["mean"]
                 std = buffer["std"]
-                assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
-                assert not torch.isinf(std).any(), _no_stats_error_str("std")
+                if torch.isinf(mean).any() or torch.isinf(std).any():
+                    logging.warning(
+                        "Missing unnormalization stats for '%s'. Leaving values in normalized space.",
+                        key,
+                    )
+                    continue
                 batch[key] = batch[key] * std + mean
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min = buffer["min"]
                 max = buffer["max"]
-                assert not torch.isinf(min).any(), _no_stats_error_str("min")
-                assert not torch.isinf(max).any(), _no_stats_error_str("max")
+                if torch.isinf(min).any() or torch.isinf(max).any():
+                    logging.warning(
+                        "Missing unnormalization stats for '%s'. Leaving values in normalized space.",
+                        key,
+                    )
+                    continue
                 batch[key] = (batch[key] + 1) / 2
                 batch[key] = batch[key] * (max - min) + min
             else:
