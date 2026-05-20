@@ -72,6 +72,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validate_paths(policy_path: Path, robot_port: str) -> None:
+    if not policy_path.exists():
+        raise FileNotFoundError(f"Policy path not found: {policy_path}")
+    if not policy_path.is_dir():
+        raise FileNotFoundError(f"Policy path must be a directory: {policy_path}")
+
+    config_file = policy_path / "config.json"
+    safetensor_file = policy_path / "model.safetensors"
+    if not config_file.exists():
+        raise FileNotFoundError(f"Policy config.json not found in {policy_path}")
+    if not safetensor_file.exists():
+        raise FileNotFoundError(
+            f"Policy weights not found in {policy_path}. Expected {safetensor_file.name}."
+        )
+
+    if not Path(robot_port).exists():
+        raise FileNotFoundError(f"Robot port not found: {robot_port}")
+
+
 def build_observation_frame(observation: dict[str, np.ndarray], robot: SO101Follower, policy) -> dict[str, np.ndarray]:
     frame: dict[str, np.ndarray] = {}
 
@@ -105,13 +124,24 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
 
+    logging.info("Jetson optimization: OMP_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s MKL_NUM_THREADS=%s NUMEXPR_NUM_THREADS=%s",
+                 os.environ.get("OMP_NUM_THREADS"),
+                 os.environ.get("OPENBLAS_NUM_THREADS"),
+                 os.environ.get("MKL_NUM_THREADS"),
+                 os.environ.get("NUMEXPR_NUM_THREADS"),
+    )
+
+    validate_paths(Path(args.policy_path), args.robot_port)
+
     if args.device == "cuda" and not torch.cuda.is_available():
         logging.warning("CUDA is not available. Falling back to CPU.")
         args.device = "cpu"
-
     if args.device == "mps" and not torch.backends.mps.is_available():
         logging.warning("MPS is not available. Falling back to CPU.")
         args.device = "cpu"
+
+    logging.info("CUDA available: %s", torch.cuda.is_available())
+    logging.info("Requested device: %s", args.device)
 
     device = get_safe_torch_device(args.device, log=True)
     torch.set_num_threads(1)
@@ -119,30 +149,29 @@ def main() -> int:
     torch.backends.cudnn.benchmark = True
 
     policy_path = Path(args.policy_path)
-    if not policy_path.exists():
-        raise FileNotFoundError(f"Policy path not found: {policy_path}")
-
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
     policy_cfg.device = args.device
     policy_cfg.use_amp = args.use_amp
+
+    if args.use_amp and args.device != "cuda":
+        logging.warning("Automatic mixed precision requested but only available on CUDA. Disabling AMP.")
+        policy_cfg.use_amp = False
 
     policy_cls = get_policy_class(policy_cfg.type)
     policy = policy_cls.from_pretrained(policy_path, config=policy_cfg)
     policy.reset()
 
-    logging.info("Loaded pretrained policy %s", policy_cfg.type)
+    logging.info("Loaded pretrained policy '%s'", policy_cfg.type)
     logging.info("Policy device: %s", policy_cfg.device)
-    logging.info("Policy input keys: %s", sorted(policy_cfg.input_features.keys()))
-    logging.info("Policy output keys: %s", sorted(policy_cfg.output_features.keys()))
+    logging.info("Policy input features: %s", sorted(policy_cfg.input_features.keys()))
+    logging.info("Policy output features: %s", sorted(policy_cfg.output_features.keys()))
 
     image_features = list(policy_cfg.image_features.keys())
     if args.camera_name is None:
         if len(image_features) == 1:
             args.camera_name = image_features[0].removeprefix("observation.images.")
             logging.info("Inferred camera name '%s' from policy config.", args.camera_name)
-        elif len(image_features) == 0:
-            logging.info("Policy does not require image input.")
-        else:
+        elif len(image_features) > 1:
             raise ValueError(
                 "Policy expects multiple image inputs. Please provide --camera-name to match policy image feature keys."
             )
@@ -167,7 +196,12 @@ def main() -> int:
     robot = SO101Follower(robot_cfg)
 
     logging.info("Connecting robot on port %s", args.robot_port)
-    robot.connect()
+    try:
+        robot.connect()
+    except Exception:
+        logging.exception("Robot connection failed")
+        raise
+
     logging.info("Robot connected. Starting inference loop.")
 
     try:
@@ -179,7 +213,7 @@ def main() -> int:
                 frame,
                 policy,
                 device,
-                args.use_amp,
+                policy_cfg.use_amp,
                 task=args.task,
                 robot_type=robot.robot_type,
             )
@@ -189,9 +223,15 @@ def main() -> int:
             step += 1
     except KeyboardInterrupt:
         logging.info("Interrupted by user.")
+    except Exception:
+        logging.exception("Inference loop failed")
+        raise
     finally:
         logging.info("Disconnecting robot.")
-        robot.disconnect()
+        try:
+            robot.disconnect()
+        except Exception:
+            logging.exception("Failed to disconnect robot cleanly")
     return 0
 
 
