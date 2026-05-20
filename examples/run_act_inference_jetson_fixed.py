@@ -220,19 +220,21 @@ def create_robot_camera_configs(required_image_features: list[str], camera_mappi
 
         for name in required_names:
             cameras[name] = OpenCVCameraConfig(
-                camera_mapping[name],
-                args.camera_fps,
-                args.camera_width,
-                args.camera_height,
+                index_or_path=camera_mapping[name],
+                fps=args.camera_fps,
+                width=args.camera_width,
+                height=args.camera_height,
+                color_mode="rgb",
             )
         return cameras
 
     if len(required_names) == 1:
         cameras[required_names[0]] = OpenCVCameraConfig(
-            args.camera_index[0] if args.camera_index else 0,
-            args.camera_fps,
-            args.camera_width,
-            args.camera_height,
+            index_or_path=args.camera_index[0] if args.camera_index else 0,
+            fps=args.camera_fps,
+            width=args.camera_width,
+            height=args.camera_height,
+            color_mode="rgb",
         )
         return cameras
 
@@ -341,6 +343,16 @@ def main() -> int:
     camera_mapping = parse_camera_mapping(args)
     cameras = create_robot_camera_configs(image_features, camera_mapping, args)
     logging.info("Using camera mappings: %s", {name: cfg.index_or_path for name, cfg in cameras.items()})
+    for name, cfg in cameras.items():
+        logging.info(
+            "Camera %s: index=%s width=%s height=%s fps=%s color_mode=%s",
+            name,
+            cfg.index_or_path,
+            cfg.width,
+            cfg.height,
+            cfg.fps,
+            cfg.color_mode,
+        )
 
     robot_cfg = SO101FollowerConfig(
         port=args.robot_port,
