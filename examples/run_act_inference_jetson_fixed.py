@@ -16,7 +16,6 @@
 import argparse
 import logging
 import os
-import sys
 from pathlib import Path
 
 # Jetson optimization: limit thread creation before loading torch.
@@ -28,6 +27,11 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import numpy as np
 import torch
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.policies.factory import get_policy_class
@@ -36,6 +40,18 @@ from lerobot.utils.utils import get_safe_torch_device
 from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig
 from lerobot.robots.so101_follower.so101_follower import SO101Follower
 
+DEFAULT_POLICY_PATH = Path(
+    "/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model"
+)
+DEFAULT_ROBOT_PORT = "/dev/ttyACM0"
+DEFAULT_ROBOT_ID = "my_follower"
+DEFAULT_CAMERA_WIDTH = 640
+DEFAULT_CAMERA_HEIGHT = 480
+DEFAULT_CAMERA_FPS = 15
+DEFAULT_DEVICE = "cuda"
+DEFAULT_TASK = "test"
+DEFAULT_CAMERA_DETECT_MAX_INDEX = 5
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -43,28 +59,52 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--policy-path",
-        default="/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model",
+        default=str(DEFAULT_POLICY_PATH),
         help="Path to the pretrained policy directory.",
     )
     parser.add_argument(
         "--robot-port",
-        default="/dev/ttyACM0",
+        default=DEFAULT_ROBOT_PORT,
         help="Serial port for the SO101 follower robot.",
     )
-    parser.add_argument("--robot-id", default="my_follower", help="Unique robot id used for calibration storage.")
-    parser.add_argument("--camera-name", default=None, help="Camera key expected by the policy config.")
-    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
-    parser.add_argument("--camera-width", type=int, default=640, help="Camera frame width.")
-    parser.add_argument("--camera-height", type=int, default=480, help="Camera frame height.")
-    parser.add_argument("--camera-fps", type=int, default=15, help="Requested camera FPS.")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu", "mps"], help="Torch device to use.")
+    parser.add_argument("--robot-id", default=DEFAULT_ROBOT_ID, help="Unique robot id used for calibration storage.")
+    parser.add_argument(
+        "--camera-config",
+        action="append",
+        default=[],
+        help=(
+            "Camera mapping in the form front=0 or top=1. "
+            "Repeat for multiple cameras."
+        ),
+    )
+    parser.add_argument(
+        "--camera-name",
+        action="append",
+        default=[],
+        help=(
+            "Legacy camera name(s) for a single mapping. "
+            "Repeat with --camera-index for multiple cameras."
+        ),
+    )
+    parser.add_argument(
+        "--camera-index",
+        action="append",
+        type=int,
+        default=[],
+        help="Legacy camera index(s) paired with --camera-name.",
+    )
+    parser.add_argument("--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH, help="Camera frame width.")
+    parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT, help="Camera frame height.")
+    parser.add_argument("--camera-fps", type=int, default=DEFAULT_CAMERA_FPS, help="Requested camera FPS.")
+    parser.add_argument("--device", default=DEFAULT_DEVICE, choices=["cuda", "cpu", "mps"], help="Torch device to use.")
     parser.add_argument(
         "--use-amp",
         action="store_true",
         default=True,
         help="Enable automatic mixed precision for CUDA inference.",
     )
-    parser.add_argument("--task", default="test", help="Task string to pass to the policy during inference.")
+    parser.add_argument("--no-amp", dest="use_amp", action="store_false", help="Disable automatic mixed precision.")
+    parser.add_argument("--task", default=DEFAULT_TASK, help="Task string to pass to the policy during inference.")
     parser.add_argument(
         "--max-relative-target",
         type=float,
@@ -82,7 +122,29 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Number of control steps to run. Use 0 to run until interrupted.",
     )
+    parser.add_argument(
+        "--detect-cameras",
+        action="store_true",
+        help="Probe OpenCV camera indices 0..5 and print available cameras.",
+    )
     return parser.parse_args()
+
+
+def detect_connected_cameras(max_index: int = DEFAULT_CAMERA_DETECT_MAX_INDEX) -> list[int]:
+    if cv2 is None:
+        logging.warning("OpenCV is not installed. Camera detection is disabled.")
+        return []
+
+    available = []
+    for index in range(max_index + 1):
+        capture = cv2.VideoCapture(index)
+        if capture is None:
+            continue
+        opened = capture.isOpened()
+        capture.release()
+        if opened:
+            available.append(index)
+    return available
 
 
 def validate_paths(policy_path: Path, robot_port: str) -> None:
@@ -104,6 +166,81 @@ def validate_paths(policy_path: Path, robot_port: str) -> None:
         raise FileNotFoundError(f"Robot port not found: {robot_port}")
 
 
+def parse_camera_mapping(args: argparse.Namespace) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    for config_str in args.camera_config:
+        if "=" not in config_str:
+            raise ValueError(
+                "Invalid --camera-config format. Use front=0 or top=1."
+            )
+        name, index_str = config_str.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError("Camera name cannot be empty in --camera-config.")
+        try:
+            mapping[name] = int(index_str)
+        except ValueError as exc:
+            raise ValueError(f"Camera index must be an integer in --camera-config: {config_str}") from exc
+
+    if args.camera_name or args.camera_index:
+        if len(args.camera_name) != len(args.camera_index):
+            raise ValueError(
+                "When using --camera-name and --camera-index together, the counts must match."
+            )
+        for name, index in zip(args.camera_name, args.camera_index):
+            mapping[name] = index
+    return mapping
+
+
+def create_robot_camera_configs(required_image_features: list[str], camera_mapping: dict[str, int], args: argparse.Namespace) -> dict[str, OpenCVCameraConfig]:
+    cameras: dict[str, OpenCVCameraConfig] = {}
+    required_names = [key.removeprefix("observation.images.") for key in required_image_features]
+
+    if not required_names:
+        return cameras
+
+    if not camera_mapping and len(required_names) > 1:
+        available = detect_connected_cameras()
+        raise ValueError(
+            "The policy requires multiple image inputs (" + ", ".join(required_names) + "). "
+            "Provide --camera-config front=0 --camera-config top=1 or use --camera-name/--camera-index. "
+            f"Detected camera indices: {available if available else 'none'}."
+        )
+
+    if camera_mapping:
+        missing = [name for name in required_names if name not in camera_mapping]
+        if missing:
+            available = detect_connected_cameras()
+            raise ValueError(
+                "Missing camera mapping for features: "
+                + ", ".join(f"observation.images.{name}" for name in missing)
+                + ". Provide --camera-config for each required camera. "
+                f"Detected camera indices: {available if available else 'none'}."
+            )
+
+        for name in required_names:
+            cameras[name] = OpenCVCameraConfig(
+                camera_mapping[name],
+                args.camera_fps,
+                args.camera_width,
+                args.camera_height,
+            )
+        return cameras
+
+    if len(required_names) == 1:
+        cameras[required_names[0]] = OpenCVCameraConfig(
+            args.camera_index[0] if args.camera_index else 0,
+            args.camera_fps,
+            args.camera_width,
+            args.camera_height,
+        )
+        return cameras
+
+    raise ValueError(
+        "Unable to build camera configuration. Please provide --camera-config for multiple image inputs."
+    )
+
+
 def build_observation_frame(observation: dict[str, np.ndarray], robot: SO101Follower, policy) -> dict[str, np.ndarray]:
     frame: dict[str, np.ndarray] = {}
 
@@ -116,7 +253,8 @@ def build_observation_frame(observation: dict[str, np.ndarray], robot: SO101Foll
         camera_name = key.removeprefix("observation.images.")
         if camera_name not in observation:
             raise KeyError(
-                f"Policy expects camera '{camera_name}' but robot observation contained: {list(observation.keys())}"
+                "Missing camera observation for feature '" + key + "'. "
+                f"Available observation keys: {list(observation.keys())}."
             )
         frame[key] = observation[camera_name]
 
@@ -148,6 +286,7 @@ def main() -> int:
     logging.info("  policy_path=%s", args.policy_path)
     logging.info("  robot_port=%s", args.robot_port)
     logging.info("  robot_id=%s", args.robot_id)
+    logging.info("  camera_config=%s", args.camera_config)
     logging.info("  camera_name=%s", args.camera_name)
     logging.info("  camera_index=%s", args.camera_index)
     logging.info("  camera_width=%s", args.camera_width)
@@ -157,6 +296,11 @@ def main() -> int:
     logging.info("  use_amp=%s", args.use_amp)
     logging.info("  task=%s", args.task)
     logging.info("  steps=%s", args.steps)
+    logging.info("  detect_cameras=%s", args.detect_cameras)
+
+    if args.detect_cameras:
+        available = detect_connected_cameras()
+        logging.info("Detected camera indices: %s", available)
 
     validate_paths(Path(args.policy_path), args.robot_port)
 
@@ -193,24 +337,10 @@ def main() -> int:
     logging.info("Policy input features: %s", sorted(policy_cfg.input_features.keys()))
     logging.info("Policy output features: %s", sorted(policy_cfg.output_features.keys()))
 
-    image_features = list(policy_cfg.image_features.keys())
-    if args.camera_name is None:
-        if len(image_features) == 1:
-            args.camera_name = image_features[0].removeprefix("observation.images.")
-            logging.info("Inferred camera name '%s' from policy config.", args.camera_name)
-        elif len(image_features) > 1:
-            raise ValueError(
-                "Policy expects multiple image inputs. Please provide --camera-name to match policy image feature keys."
-            )
-
-    cameras = {}
-    if args.camera_name is not None:
-        cameras[args.camera_name] = OpenCVCameraConfig(
-            args.camera_index,
-            args.camera_fps,
-            args.camera_width,
-            args.camera_height,
-        )
+    image_features = sorted(policy_cfg.image_features.keys())
+    camera_mapping = parse_camera_mapping(args)
+    cameras = create_robot_camera_configs(image_features, camera_mapping, args)
+    logging.info("Using camera mappings: %s", {name: cfg.index_or_path for name, cfg in cameras.items()})
 
     robot_cfg = SO101FollowerConfig(
         port=args.robot_port,

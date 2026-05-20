@@ -1,3 +1,5 @@
 cd /home/user/project/lerobot
 export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
-python examples/run_act_inference_jetson_fixed.py
+python examples/run_act_inference_jetson_fixed.py \
+  --camera-config front=2 \
+  --camera-config top=0
