@@ -1,6 +1,0 @@
-python3 examples/run_act_inference_jetson_fixed.py \
-  --camera-config front=2 \
-  --camera-config top=0 \
-  --invert-action-all \
-  --action-scale 0.3 \
-  --steps 10

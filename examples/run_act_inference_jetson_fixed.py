@@ -17,6 +17,9 @@ import argparse
 import json
 import logging
 import os
+import socket
+import time
+from enum import Enum
 from pathlib import Path
 
 # Jetson optimization: limit thread creation before loading torch.
@@ -57,6 +60,20 @@ DEFAULT_CAMERA_FPS = 30
 DEFAULT_DEVICE = "cuda"
 DEFAULT_TASK = "test"
 DEFAULT_CAMERA_DETECT_MAX_INDEX = 5
+DEFAULT_TRIGGER_HOST = "0.0.0.0"
+DEFAULT_TRIGGER_PORT = 8765
+DEFAULT_PLACEMENT_TASKS = [
+    "stack blue box on floor 1",
+    "stack blue box on floor 2",
+    "stack blue box beside floor 2 on floor 1",
+]
+
+
+class RobotRunState(Enum):
+    WAIT = "WAIT"
+    RUNNING = "RUNNING"
+    RETURN_HOME = "RETURN_HOME"
+    DONE = "DONE"
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,8 +162,59 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--steps",
         type=int,
-        default=0,
-        help="Number of control steps to run. Use 0 to run until interrupted.",
+        default=10,
+        help=(
+            "Number of ACT control steps for one triggered stacking run. "
+            "In immediate mode, use 0 to run until interrupted."
+        ),
+    )
+    parser.add_argument(
+        "--mcp-trigger-tcp",
+        action="store_true",
+        help="Wait for MCP TCP 'run' signals instead of running ACT inference continuously.",
+    )
+    parser.add_argument(
+        "--trigger-host",
+        default=DEFAULT_TRIGGER_HOST,
+        help="Host/IP to bind for MCP TCP trigger signals.",
+    )
+    parser.add_argument(
+        "--trigger-port",
+        type=int,
+        default=DEFAULT_TRIGGER_PORT,
+        help="TCP port to bind for MCP trigger signals.",
+    )
+    parser.add_argument(
+        "--max-runs",
+        type=int,
+        default=3,
+        help="Maximum number of triggered stacking runs before DONE.",
+    )
+    parser.add_argument(
+        "--placement-task",
+        action="append",
+        default=[],
+        help=(
+            "Task string for each stacking run. Repeat up to --max-runs times. "
+            "Defaults are floor 1, floor 2, and floor-1 beside floor 2."
+        ),
+    )
+    parser.add_argument(
+        "--return-home-steps",
+        type=int,
+        default=30,
+        help="Number of repeated home-position commands after each triggered run.",
+    )
+    parser.add_argument(
+        "--control-period-s",
+        type=float,
+        default=0.0,
+        help="Optional sleep time between robot commands.",
+    )
+    parser.add_argument(
+        "--wait-reset-after-done",
+        action="store_true",
+        help="After --max-runs, keep the TCP server alive and wait for a 'reset' signal.",
     )
     parser.add_argument(
         "--detect-cameras",
@@ -622,6 +690,297 @@ def build_action_dict(
     return {key: float(value) for key, value in zip(action_keys, action_values)}
 
 
+def log_state(state: RobotRunState, message: str, *args) -> None:
+    logging.info("[%s] " + message, state.value, *args)
+
+
+def resolve_placement_tasks(raw_tasks: list[str], max_runs: int) -> list[str]:
+    tasks = raw_tasks if raw_tasks else DEFAULT_PLACEMENT_TASKS
+    if len(tasks) < max_runs:
+        raise ValueError(
+            f"Need at least {max_runs} placement task(s), but got {len(tasks)}. "
+            "Repeat --placement-task for each run."
+        )
+    return tasks[:max_runs]
+
+
+def parse_trigger_command(payload: str) -> str | None:
+    payload = payload.strip()
+    if not payload:
+        return None
+
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, dict):
+        raw_command = data.get("command") or data.get("signal") or data.get("event")
+        command = str(raw_command).strip().lower() if raw_command is not None else ""
+    else:
+        command = payload.splitlines()[0].strip().lower()
+
+    if command in {"run", "start", "stack", "trigger"}:
+        return "run"
+    if command in {"reset", "restart"}:
+        return "reset"
+    return None
+
+
+def read_trigger_command(client: socket.socket) -> str | None:
+    client.settimeout(2.0)
+    chunks = []
+    while True:
+        try:
+            chunk = client.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n" in chunk:
+            break
+
+    payload = b"".join(chunks).decode("utf-8", errors="replace")
+    return parse_trigger_command(payload)
+
+
+def send_trigger_response(client: socket.socket, message: str) -> None:
+    try:
+        client.sendall((message + "\n").encode("utf-8"))
+    except OSError:
+        logging.debug("Failed to send trigger response to MCP client", exc_info=True)
+
+
+def create_trigger_server(host: str, port: int) -> socket.socket:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen()
+    server.settimeout(0.5)
+    logging.info("MCP TCP trigger server listening on %s:%s", host, port)
+    return server
+
+
+def accept_trigger(server: socket.socket) -> str | None:
+    try:
+        client, address = server.accept()
+    except socket.timeout:
+        return None
+
+    with client:
+        command = read_trigger_command(client)
+        if command is None:
+            logging.warning("Ignored unknown MCP trigger from %s", address)
+            send_trigger_response(client, "ignored unknown command")
+            return None
+
+        logging.info("Received MCP trigger '%s' from %s", command, address)
+        send_trigger_response(client, f"accepted {command}")
+        return command
+
+
+def drain_pending_triggers(server: socket.socket, state: RobotRunState) -> None:
+    previous_timeout = server.gettimeout()
+    server.settimeout(0.0)
+    try:
+        while True:
+            try:
+                client, address = server.accept()
+            except (BlockingIOError, socket.timeout):
+                break
+            with client:
+                command = read_trigger_command(client)
+                log_state(state, "Ignoring MCP trigger while busy: command=%s address=%s", command, address)
+                send_trigger_response(client, f"ignored while {state.value}")
+    finally:
+        server.settimeout(previous_timeout)
+
+
+def build_home_action(observation: dict[str, np.ndarray], action_keys: list[str]) -> dict[str, float]:
+    missing = [key for key in action_keys if key not in observation]
+    if missing:
+        raise KeyError(f"Cannot build home action. Missing observation keys: {missing}")
+    return {key: float(observation[key]) for key in action_keys}
+
+
+def sleep_control_period(control_period_s: float) -> None:
+    if control_period_s > 0:
+        time.sleep(control_period_s)
+
+
+def run_act_once(
+    run_index: int,
+    task: str,
+    steps: int,
+    robot: SO101Follower,
+    policy,
+    device: torch.device,
+    use_amp: bool,
+    action_scale: float,
+    invert_action_all: bool,
+    invert_action_keys: set[str],
+    control_period_s: float,
+) -> None:
+    if steps <= 0:
+        raise ValueError("--steps must be greater than 0 in MCP trigger mode.")
+
+    policy.reset()
+    log_state(RobotRunState.RUNNING, "Run %s started. task=%s steps=%s", run_index, task, steps)
+    for step in range(steps):
+        observation = robot.get_observation()
+        frame = build_observation_frame(observation, robot, policy)
+        action_tensor = predict_action(
+            frame,
+            policy,
+            device,
+            use_amp,
+            task=task,
+            robot_type=robot.robot_type,
+        )
+        action_dict = build_action_dict(
+            action_tensor,
+            robot,
+            action_scale=action_scale,
+            invert_action_all=invert_action_all,
+            invert_action_keys=invert_action_keys,
+        )
+        sent_action = robot.send_action(action_dict)
+        logging.info("Run %s step %s action=%s", run_index, step, sent_action)
+        sleep_control_period(control_period_s)
+    log_state(RobotRunState.RUNNING, "Run %s completed.", run_index)
+
+
+def return_home(
+    run_index: int,
+    robot: SO101Follower,
+    home_action: dict[str, float],
+    return_home_steps: int,
+    control_period_s: float,
+) -> None:
+    if return_home_steps <= 0:
+        log_state(RobotRunState.RETURN_HOME, "Run %s return home skipped.", run_index)
+        return
+
+    log_state(RobotRunState.RETURN_HOME, "Run %s returning home. steps=%s", run_index, return_home_steps)
+    for step in range(return_home_steps):
+        sent_action = robot.send_action(home_action)
+        logging.info("Return home run %s step %s action=%s", run_index, step, sent_action)
+        sleep_control_period(control_period_s)
+
+
+def run_immediate_loop(
+    args: argparse.Namespace,
+    robot: SO101Follower,
+    policy,
+    device: torch.device,
+    use_amp: bool,
+    invert_action_keys: set[str],
+) -> None:
+    logging.info("Robot connected. Starting immediate inference loop.")
+    step = 0
+    while args.steps == 0 or step < args.steps:
+        observation = robot.get_observation()
+        frame = build_observation_frame(observation, robot, policy)
+        action_tensor = predict_action(
+            frame,
+            policy,
+            device,
+            use_amp,
+            task=args.task,
+            robot_type=robot.robot_type,
+        )
+        action_dict = build_action_dict(
+            action_tensor,
+            robot,
+            action_scale=args.action_scale,
+            invert_action_all=args.invert_action_all,
+            invert_action_keys=invert_action_keys,
+        )
+        sent_action = robot.send_action(action_dict)
+        logging.info("Step %s action=%s", step, sent_action)
+        step += 1
+        sleep_control_period(args.control_period_s)
+
+
+def run_mcp_trigger_loop(
+    args: argparse.Namespace,
+    robot: SO101Follower,
+    policy,
+    device: torch.device,
+    use_amp: bool,
+    invert_action_keys: set[str],
+    action_keys: list[str],
+) -> None:
+    placement_tasks = resolve_placement_tasks(args.placement_task, args.max_runs)
+    home_observation = robot.get_observation()
+    home_action = build_home_action(home_observation, action_keys)
+
+    completed_runs = 0
+    last_wait_run = None
+    done_logged = False
+    with create_trigger_server(args.trigger_host, args.trigger_port) as server:
+        while True:
+            if completed_runs >= args.max_runs:
+                if not done_logged:
+                    log_state(RobotRunState.DONE, "Completed %s/%s runs.", completed_runs, args.max_runs)
+                    done_logged = True
+                if not args.wait_reset_after_done:
+                    return
+
+                command = accept_trigger(server)
+                if command == "reset":
+                    completed_runs = 0
+                    last_wait_run = None
+                    done_logged = False
+                    log_state(RobotRunState.WAIT, "Reset received. Waiting for run signal.")
+                elif command == "run":
+                    log_state(RobotRunState.DONE, "Ignoring run signal after DONE. Send reset first.")
+                continue
+
+            next_run = completed_runs + 1
+            next_task = placement_tasks[completed_runs]
+            if last_wait_run != next_run:
+                log_state(
+                    RobotRunState.WAIT,
+                    "Waiting for MCP run signal. next_run=%s/%s task=%s",
+                    next_run,
+                    args.max_runs,
+                    next_task,
+                )
+                last_wait_run = next_run
+
+            command = accept_trigger(server)
+            if command is None:
+                continue
+            if command == "reset":
+                completed_runs = 0
+                last_wait_run = None
+                log_state(RobotRunState.WAIT, "Reset received. Counter already reset.")
+                continue
+            if command != "run":
+                continue
+
+            run_act_once(
+                next_run,
+                next_task,
+                args.steps,
+                robot,
+                policy,
+                device,
+                use_amp,
+                args.action_scale,
+                args.invert_action_all,
+                invert_action_keys,
+                args.control_period_s,
+            )
+            drain_pending_triggers(server, RobotRunState.RUNNING)
+            return_home(next_run, robot, home_action, args.return_home_steps, args.control_period_s)
+            drain_pending_triggers(server, RobotRunState.RETURN_HOME)
+            completed_runs += 1
+            last_wait_run = None
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
@@ -650,10 +1009,24 @@ def main() -> int:
     logging.info("  invert_action_all=%s", args.invert_action_all)
     logging.info("  invert_action=%s", args.invert_action)
     logging.info("  steps=%s", args.steps)
+    logging.info("  mcp_trigger_tcp=%s", args.mcp_trigger_tcp)
+    logging.info("  trigger_host=%s", args.trigger_host)
+    logging.info("  trigger_port=%s", args.trigger_port)
+    logging.info("  max_runs=%s", args.max_runs)
+    logging.info("  placement_task=%s", args.placement_task)
+    logging.info("  return_home_steps=%s", args.return_home_steps)
+    logging.info("  control_period_s=%s", args.control_period_s)
+    logging.info("  wait_reset_after_done=%s", args.wait_reset_after_done)
     logging.info("  detect_cameras=%s", args.detect_cameras)
 
     if args.action_scale <= 0:
         raise ValueError("--action-scale must be greater than 0.")
+    if args.max_runs <= 0:
+        raise ValueError("--max-runs must be greater than 0.")
+    if args.return_home_steps < 0:
+        raise ValueError("--return-home-steps must be 0 or greater.")
+    if args.control_period_s < 0:
+        raise ValueError("--control-period-s must be 0 or greater.")
 
     if args.detect_cameras:
         available = detect_connected_cameras()
@@ -752,31 +1125,28 @@ def main() -> int:
         logging.exception("Robot connection failed")
         raise
 
-    logging.info("Robot connected. Starting inference loop.")
+    logging.info("Robot connected.")
 
     try:
-        step = 0
-        while args.steps == 0 or step < args.steps:
-            observation = robot.get_observation()
-            frame = build_observation_frame(observation, robot, policy)
-            action_tensor = predict_action(
-                frame,
+        if args.mcp_trigger_tcp:
+            run_mcp_trigger_loop(
+                args,
+                robot,
                 policy,
                 device,
                 policy_cfg.use_amp,
-                task=args.task,
-                robot_type=robot.robot_type,
+                invert_action_keys,
+                action_keys,
             )
-            action_dict = build_action_dict(
-                action_tensor,
+        else:
+            run_immediate_loop(
+                args,
                 robot,
-                action_scale=args.action_scale,
-                invert_action_all=args.invert_action_all,
-                invert_action_keys=invert_action_keys,
+                policy,
+                device,
+                policy_cfg.use_amp,
+                invert_action_keys,
             )
-            sent_action = robot.send_action(action_dict)
-            logging.info("Step %s action=%s", step, sent_action)
-            step += 1
     except KeyboardInterrupt:
         logging.info("Interrupted by user.")
     except Exception:

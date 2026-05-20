@@ -1,0 +1,60 @@
+Jetson Orin Nano 터미널에서 먼저 로봇팔 서버를 이렇게 실행하세요:
+
+```bash
+cd /home/user/project/lerobot
+
+python3 examples/run_act_inference_jetson_fixed.py \
+  --camera-config front=2 \
+  --camera-config top=0 \
+  --mcp-trigger-tcp \
+  --trigger-host 0.0.0.0 \
+  --trigger-port 8765 \
+  --max-runs 3 \
+  --placement-task "stack blue box on floor 1" \
+  --placement-task "stack blue box on floor 2" \
+  --placement-task "stack blue box beside floor 2 on floor 1" \
+  --steps 10 \
+  --return-home-steps 30 \
+  --invert-action-all \
+  --action-scale 0.3
+```
+
+안전 테스트용 첫 실행은 더 약하게 추천합니다:
+
+```bash
+python3 examples/run_act_inference_jetson_fixed.py \
+  --camera-config front=2 \
+  --camera-config top=0 \
+  --mcp-trigger-tcp \
+  --trigger-host 0.0.0.0 \
+  --trigger-port 8765 \
+  --max-runs 3 \
+  --steps 1 \
+  --return-home-steps 10 \
+  --invert-action-all \
+  --action-scale 0.1
+```
+
+MCP 신호 테스트는 Jetson에서 다른 터미널을 열고:
+
+```bash
+printf 'run\n' | nc 127.0.0.1 8765
+```
+
+MCP가 다른 장치에서 보낼 때는:
+
+```bash
+printf 'run\n' | nc JETSON_IP 8765
+```
+
+3회 완료 후 reset 대기까지 쓰려면 실행 명령에 이것도 추가하세요:
+
+```bash
+--wait-reset-after-done
+```
+
+reset 신호:
+
+```bash
+printf 'reset\n' | nc JETSON_IP 8765
+```
