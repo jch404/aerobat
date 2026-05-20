@@ -112,7 +112,9 @@ def predict_action(
     ):
         # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
         for name in observation:
-            observation[name] = torch.from_numpy(observation[name])
+            # Use a safe conversion to handle non-standard numpy array subclasses
+            # or memory-layout issues that can make torch.from_numpy fail.
+            observation[name] = torch.as_tensor(observation[name].copy())
             if "image" in name:
                 observation[name] = observation[name].type(torch.float32) / 255
                 observation[name] = observation[name].permute(2, 0, 1).contiguous()

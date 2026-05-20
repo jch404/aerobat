@@ -1,9 +1,33 @@
+아래 명령어들을 Jetson에서 그대로 실행하세요.
+
+```bash
 cd /home/user/project/lerobot
-python3 examples/run_act_inference_jetson_fixed.py \
+
+# 실시간 로그(버퍼 없이)로 실행 (front=2, top=0, fps=30)
+python3 -u examples/run_act_inference_jetson_fixed.py \
   --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
   --robot-port /dev/ttyACM0 \
   --robot-id my_follower \
   --camera-config front=2 \
   --camera-config top=0 \
   --device cuda \
-  --use-amp
+  --use-amp \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30
+```
+
+문제 진단용(카메라 인덱스 자동 감지):
+```bash
+python3 -u examples/run_act_inference_jetson_fixed.py --detect-cameras
+```
+
+백그라운드 실행(예: `tmux`나 `nohup` 사용):
+```bash
+nohup python3 examples/run_act_inference_jetson_fixed.py ... > run.log 2>&1 &
+# 또는 tmux 세션 생성 후 실행
+tmux new -s act_run
+# (세션 안에서 앞의 python 명령 실행)
+```
+
+충돌 또는 오류가 나오면 콘솔 출력 전체를 붙여넣어 주세요.
