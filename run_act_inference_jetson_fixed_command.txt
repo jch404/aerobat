@@ -1,0 +1,3 @@
+cd /home/user/project/lerobot
+export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
+python examples/run_act_inference_jetson_fixed.py

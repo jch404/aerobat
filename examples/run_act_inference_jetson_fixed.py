@@ -41,8 +41,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a pretrained ACT policy on a SO101 follower robot with CUDA on Jetson."
     )
-    parser.add_argument("--policy-path", required=True, help="Path to the pretrained policy directory.")
-    parser.add_argument("--robot-port", required=True, help="Serial port for the SO101 follower robot.")
+    parser.add_argument(
+        "--policy-path",
+        default="/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model",
+        help="Path to the pretrained policy directory.",
+    )
+    parser.add_argument(
+        "--robot-port",
+        default="/dev/ttyACM0",
+        help="Serial port for the SO101 follower robot.",
+    )
     parser.add_argument("--robot-id", default="my_follower", help="Unique robot id used for calibration storage.")
     parser.add_argument("--camera-name", default=None, help="Camera key expected by the policy config.")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
@@ -50,8 +58,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-height", type=int, default=480, help="Camera frame height.")
     parser.add_argument("--camera-fps", type=int, default=15, help="Requested camera FPS.")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu", "mps"], help="Torch device to use.")
-    parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision for CUDA inference.")
-    parser.add_argument("--task", default="", help="Task string to pass to the policy during inference.")
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        default=True,
+        help="Enable automatic mixed precision for CUDA inference.",
+    )
+    parser.add_argument("--task", default="test", help="Task string to pass to the policy during inference.")
     parser.add_argument(
         "--max-relative-target",
         type=float,
@@ -130,6 +143,20 @@ def main() -> int:
                  os.environ.get("MKL_NUM_THREADS"),
                  os.environ.get("NUMEXPR_NUM_THREADS"),
     )
+
+    logging.info("Running with configuration:")
+    logging.info("  policy_path=%s", args.policy_path)
+    logging.info("  robot_port=%s", args.robot_port)
+    logging.info("  robot_id=%s", args.robot_id)
+    logging.info("  camera_name=%s", args.camera_name)
+    logging.info("  camera_index=%s", args.camera_index)
+    logging.info("  camera_width=%s", args.camera_width)
+    logging.info("  camera_height=%s", args.camera_height)
+    logging.info("  camera_fps=%s", args.camera_fps)
+    logging.info("  device=%s", args.device)
+    logging.info("  use_amp=%s", args.use_amp)
+    logging.info("  task=%s", args.task)
+    logging.info("  steps=%s", args.steps)
 
     validate_paths(Path(args.policy_path), args.robot_port)
 
