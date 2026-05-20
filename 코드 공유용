@@ -9,3 +9,6 @@ python3 examples/run_act_inference_jetson_fixed.py \
   --device cuda \
   --task test \
   --steps 0
+
+    --dataset-repo-id <dataset_repo_id> \
+  --dataset-root /path/to/local/dataset

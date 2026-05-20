@@ -14,9 +14,11 @@
 # limitations under the License.
 
 import argparse
+import json
 import logging
 import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 # Jetson optimization: limit thread creation before loading torch.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -195,16 +197,69 @@ def find_train_config_path(policy_path: Path) -> Path | None:
     return None
 
 
+def sanitize_train_config_json(train_config_path: Path) -> Path | None:
+    with open(train_config_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    modified = False
+    if isinstance(data, dict) and "dataset" in data and isinstance(data["dataset"], dict):
+        dataset_data = data["dataset"]
+        if "streaming" in dataset_data:
+            logging.info("Removing unsupported dataset.streaming field from train_config.json")
+            dataset_data.pop("streaming", None)
+            modified = True
+
+        allowed_dataset_keys = {
+            "repo_id",
+            "root",
+            "episodes",
+            "image_transforms",
+            "revision",
+            "use_imagenet_stats",
+            "video_backend",
+        }
+        extra_keys = [key for key in dataset_data if key not in allowed_dataset_keys]
+        if extra_keys:
+            for key in extra_keys:
+                logging.info("Removing unsupported dataset field '%s' from train_config.json", key)
+                dataset_data.pop(key, None)
+            modified = True
+
+    if not modified:
+        return train_config_path
+
+    tmp_file = NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+    try:
+        json.dump(data, tmp_file, indent=2)
+        tmp_file.flush()
+        return Path(tmp_file.name)
+    finally:
+        tmp_file.close()
+
+
 def load_dataset_stats(policy_path: Path, dataset_repo_id: str | None, dataset_root: str | None) -> dict | None:
     """Load dataset normalization stats from train_config.json or explicit dataset metadata."""
     train_cfg = None
     train_config_path = find_train_config_path(policy_path)
+    temp_config_path = None
     if train_config_path is not None:
         try:
             logging.info("Found train_config.json at %s", train_config_path)
             train_cfg = TrainPipelineConfig.from_pretrained(train_config_path)
         except Exception as exc:
             logging.warning("Failed to parse train_config.json from %s: %s", train_config_path, exc)
+            try:
+                sanitized_path = sanitize_train_config_json(train_config_path)
+                if sanitized_path is not None and sanitized_path != train_config_path:
+                    logging.info("Retrying train_config.json parsing with sanitized config")
+                    train_cfg = TrainPipelineConfig.from_pretrained(sanitized_path)
+                    temp_config_path = sanitized_path
+            except Exception as exc2:
+                logging.warning(
+                    "Retry failed parsing sanitized train_config.json from %s: %s",
+                    train_config_path,
+                    exc2,
+                )
 
     if train_cfg is None and dataset_repo_id is None and dataset_root is None:
         logging.info("No train configuration or dataset metadata provided; dataset stats will not be loaded.")
@@ -233,6 +288,12 @@ def load_dataset_stats(policy_path: Path, dataset_repo_id: str | None, dataset_r
     except Exception as exc:
         logging.warning("Failed to load dataset metadata for normalization stats: %s", exc)
         return None
+    finally:
+        if temp_config_path is not None:
+            try:
+                temp_config_path.unlink()
+            except OSError:
+                pass
 
 
 def parse_camera_mapping(args: argparse.Namespace) -> dict[str, int]:
