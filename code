@@ -1,32 +1,3 @@
-MCP 없이 지금 바로 테스트할 실행 코드는 이겁니다.
-
-**1차 안전 테스트**
-
-```bash
-cd /home/user/project/lerobot
-
-python3 examples/run_act_inference_jetson_fixed.py \
-  --camera-config front=2 \
-  --camera-config top=0 \
-  --steps 1 \
-  --invert-action-all \
-  --action-scale 0.1
-```
-
-움직임 방향이 맞으면 조금 늘려서:
-
-```bash
-python3 examples/run_act_inference_jetson_fixed.py \
-  --camera-config front=2 \
-  --camera-config top=0 \
-  --steps 10 \
-  --invert-action-all \
-  --action-scale 0.3
-```
-
-MCP 대기 모드까지 가짜로 테스트하려면 첫 터미널:
-
-```bash
 python3 examples/run_act_inference_jetson_fixed.py \
   --camera-config front=2 \
   --camera-config top=0 \
@@ -34,14 +5,7 @@ python3 examples/run_act_inference_jetson_fixed.py \
   --trigger-host 0.0.0.0 \
   --trigger-port 8765 \
   --max-runs 3 \
-  --steps 1 \
-  --return-home-steps 10 \
+  --steps 30 \
+  --return-home-steps 20 \
   --invert-action-all \
-  --action-scale 0.1
-```
-
-두 번째 터미널에서 실행 신호:
-
-```bash
-printf 'run\n' | nc 127.0.0.1 8765
-```
+  --action-scale 0.2
