@@ -326,6 +326,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
         )
 
+    if cfg.policy is not None and not dataset.meta.stats:
+        logging.warning(
+            "No dataset statistics are available for the recording dataset. "
+            "When loading a pretrained ACT policy, this can cause normalization buffers to remain uninitialized "
+            "if the saved model does not include them."
+        )
+
     # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
 
