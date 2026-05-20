@@ -18,7 +18,6 @@ import json
 import logging
 import os
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 # Jetson optimization: limit thread creation before loading torch.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -35,9 +34,10 @@ except ImportError:
     cv2 = None
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.train import TrainPipelineConfig
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.datasets.utils import load_episodes_stats, load_stats
 from lerobot.policies.factory import get_policy_class
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.utils import get_safe_torch_device
@@ -197,83 +197,84 @@ def find_train_config_path(policy_path: Path) -> Path | None:
     return None
 
 
-def sanitize_train_config_json(train_config_path: Path) -> Path | None:
-    with open(train_config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def resolve_dataset_root(root_value: str | None, base_path: Path) -> str | None:
+    if root_value is None:
+        return None
+    root_path = Path(root_value)
+    if root_path.is_absolute():
+        return str(root_path)
+    return str((base_path.parent / root_path).resolve())
 
-    modified = False
-    if isinstance(data, dict) and "dataset" in data and isinstance(data["dataset"], dict):
-        dataset_data = data["dataset"]
-        if "streaming" in dataset_data:
-            logging.info("Removing unsupported dataset.streaming field from train_config.json")
-            dataset_data.pop("streaming", None)
-            modified = True
 
-        allowed_dataset_keys = {
-            "repo_id",
-            "root",
-            "episodes",
-            "image_transforms",
-            "revision",
-            "use_imagenet_stats",
-            "video_backend",
-        }
-        extra_keys = [key for key in dataset_data if key not in allowed_dataset_keys]
-        if extra_keys:
-            for key in extra_keys:
-                logging.info("Removing unsupported dataset field '%s' from train_config.json", key)
-                dataset_data.pop(key, None)
-            modified = True
-
-    if not modified:
-        return train_config_path
-
-    tmp_file = NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+def extract_dataset_info_from_train_config(train_config_path: Path) -> tuple[str | None, str | None]:
     try:
-        json.dump(data, tmp_file, indent=2)
-        tmp_file.flush()
-        return Path(tmp_file.name)
-    finally:
-        tmp_file.close()
+        with open(train_config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as exc:
+        logging.warning("Unable to read train_config.json at %s: %s", train_config_path, exc)
+        return None, None
+
+    if not isinstance(config, dict):
+        return None, None
+
+    dataset_config = config.get("dataset")
+    if not isinstance(dataset_config, dict):
+        return None, None
+
+    repo_id = dataset_config.get("repo_id")
+    if isinstance(repo_id, list):
+        repo_id = repo_id[0] if repo_id else None
+
+    root = dataset_config.get("root")
+    root = resolve_dataset_root(root, train_config_path) if isinstance(root, str) else None
+    return repo_id, root
+
+
+def load_dataset_stats_from_root(dataset_root: str | None) -> dict | None:
+    if dataset_root is None:
+        return None
+
+    root_path = Path(dataset_root)
+    if not root_path.exists():
+        logging.warning("Dataset root path does not exist: %s", root_path)
+        return None
+
+    stats = load_stats(root_path)
+    if stats is not None:
+        logging.info("Loaded normalization stats from %s/meta/stats.json", root_path)
+        return stats
+
+    try:
+        episodes_stats = load_episodes_stats(root_path)
+        stats = aggregate_stats(list(episodes_stats.values()))
+        logging.info("Loaded normalization stats by aggregating %s/meta/episodes_stats.jsonl", root_path)
+        return stats
+    except Exception as exc:
+        logging.warning("Failed to load aggregate stats from dataset root %s: %s", root_path, exc)
+        return None
 
 
 def load_dataset_stats(policy_path: Path, dataset_repo_id: str | None, dataset_root: str | None) -> dict | None:
     """Load dataset normalization stats from train_config.json or explicit dataset metadata."""
-    train_cfg = None
     train_config_path = find_train_config_path(policy_path)
-    temp_config_path = None
     if train_config_path is not None:
-        try:
-            logging.info("Found train_config.json at %s", train_config_path)
-            train_cfg = TrainPipelineConfig.from_pretrained(train_config_path)
-        except Exception as exc:
-            logging.warning("Failed to parse train_config.json from %s: %s", train_config_path, exc)
-            try:
-                sanitized_path = sanitize_train_config_json(train_config_path)
-                if sanitized_path is not None and sanitized_path != train_config_path:
-                    logging.info("Retrying train_config.json parsing with sanitized config")
-                    train_cfg = TrainPipelineConfig.from_pretrained(sanitized_path)
-                    temp_config_path = sanitized_path
-            except Exception as exc2:
-                logging.warning(
-                    "Retry failed parsing sanitized train_config.json from %s: %s",
-                    train_config_path,
-                    exc2,
-                )
+        logging.info("Found train_config.json at %s", train_config_path)
+        repo_id, root = extract_dataset_info_from_train_config(train_config_path)
+        if dataset_repo_id is None:
+            dataset_repo_id = repo_id
+        if dataset_root is None:
+            dataset_root = root
 
-    if train_cfg is None and dataset_repo_id is None and dataset_root is None:
-        logging.info("No train configuration or dataset metadata provided; dataset stats will not be loaded.")
-        return None
+    if dataset_root is not None:
+        stats = load_dataset_stats_from_root(dataset_root)
+        if stats is not None:
+            return stats
 
-    if train_cfg is not None:
-        if dataset_repo_id:
-            train_cfg.dataset.repo_id = dataset_repo_id
-        if dataset_root:
-            train_cfg.dataset.root = dataset_root
-        dataset_repo_id = train_cfg.dataset.repo_id
-        dataset_root = train_cfg.dataset.root
-    elif dataset_repo_id is None:
-        logging.info("Dataset repo id must be provided if train_config.json is unavailable.")
+    if dataset_repo_id is None:
+        logging.warning(
+            "No dataset repo id or root available for loading normalization stats. "
+            "Use --dataset-repo-id or --dataset-root if train_config.json cannot be parsed."
+        )
         return None
 
     try:
@@ -286,14 +287,8 @@ def load_dataset_stats(policy_path: Path, dataset_repo_id: str | None, dataset_r
         )
         return ds_meta.stats
     except Exception as exc:
-        logging.warning("Failed to load dataset metadata for normalization stats: %s", exc)
+        logging.warning("Failed to load dataset metadata for normalization stats from repo_id=%s root=%s: %s", dataset_repo_id, dataset_root, exc)
         return None
-    finally:
-        if temp_config_path is not None:
-            try:
-                temp_config_path.unlink()
-            except OSError:
-                pass
 
 
 def parse_camera_mapping(args: argparse.Namespace) -> dict[str, int]:
