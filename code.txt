@@ -1,32 +1,10 @@
-﻿에러 원인이 2개다.
-
-1. `﻿export` 앞에 보이지 않는 특수문자(BOM) 들어감
-2. `lerobot-record` 명령 자체가 없는 상태
-
-수정해서 아래 순서대로 다시 입력해라.
-
-```bash
-cd /home/user/project/lerobot
-
-conda activate lerobot
-
-export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
+﻿export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
-```
 
-그 다음 먼저 명령 존재 확인:
-
-```bash
-which lerobot-record
-```
-
-아무것도 안뜨면 아래로 실행해야 한다.
-
-```bash
-python -m lerobot.record \
+lerobot-record \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM0 \
   --robot.id=my_follower \
@@ -42,19 +20,3 @@ python -m lerobot.record \
   --dataset.streaming_encoding=false \
   --policy.path=/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
   --policy.device=cuda
-```
-
-네가 붙여넣은 원본에는 이 부분도 깨져있었다:
-
-```bash
-checkp  --policy.device=cudad_model
-```
-
-원래는 아래처럼 되어야 정상이다.
-
-```bash
---policy.path=/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
---policy.device=cuda
-```
-
-그리고 `bash: ﻿export: 명령어를 찾을 수 없음` 은 거의 100% 복붙하면서 숨은 문자 들어간 상황이다. 직접 타이핑하면 해결된다.
