@@ -1,18 +1,22 @@
-cd /home/user/project/lerobot
-conda activate lerobot
-export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
+﻿export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 
 lerobot-record \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM0 \
   --robot.id=my_follower \
   --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
-  --display_data=true \
+  --display_data=false \
   --dataset.repo_id=data/eval_floor1_stack \
   --dataset.num_episodes=1 \
+  --dataset.episode_time_s=20 \
+  --dataset.reset_time_s=5 \
   --dataset.single_task="stack blue box on floor 1" \
   --dataset.push_to_hub=false \
-  --dataset.streaming_encoding=true \
-  --dataset.encoder_threads=2 \
+  --dataset.video=false \
+  --dataset.streaming_encoding=false \
   --policy.path=/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
   --policy.device=cuda
