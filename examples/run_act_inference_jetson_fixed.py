@@ -40,7 +40,14 @@ from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.datasets.utils import EPISODES_STATS_PATH, STATS_PATH, load_episodes_stats, load_stats, unflatten_dict
+from lerobot.datasets.utils import (
+    EPISODES_STATS_PATH,
+    STATS_PATH,
+    load_episodes_stats,
+    load_info,
+    load_stats,
+    unflatten_dict,
+)
 from lerobot.policies.factory import get_policy_class
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.utils import get_safe_torch_device
@@ -155,6 +162,25 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Invert selected action keys. Accepts motor names with or without .pos, "
             "and comma-separated values. Example: --invert-action shoulder_pan,elbow_flex"
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run policy inference and log actions without sending commands to the robot.",
+    )
+    parser.add_argument(
+        "--debug-first-step",
+        action="store_true",
+        help="Log detailed observation/state/action mapping information on the first inference step.",
+    )
+    parser.add_argument(
+        "--flip-camera",
+        action="append",
+        default=[],
+        help=(
+            "Flip a camera image before inference. Format: front=horizontal, top=vertical, or front=both. "
+            "Repeat for multiple cameras."
         ),
     )
     parser.add_argument(
@@ -571,6 +597,77 @@ def load_dataset_stats(policy_path: Path, dataset_repo_id: str | None, dataset_r
     return None
 
 
+def resolve_dataset_root_from_config(policy_path: Path, dataset_root: str | None) -> str | None:
+    if dataset_root is not None:
+        return dataset_root
+
+    train_config_path = find_train_config_path(policy_path)
+    if train_config_path is None:
+        return None
+
+    _, root = extract_dataset_info_from_train_config(train_config_path)
+    return root
+
+
+def normalize_motor_feature_name(name: str) -> str:
+    return name if name.endswith(".pos") else f"{name}.pos"
+
+
+def load_dataset_feature_order(dataset_root: str | None) -> tuple[list[str] | None, list[str] | None]:
+    if dataset_root is None:
+        return None, None
+
+    root_path = Path(dataset_root)
+    if not root_path.exists():
+        logging.warning("Cannot load dataset feature order. Dataset root path does not exist: %s", root_path)
+        return None, None
+
+    try:
+        info = load_info(root_path)
+    except Exception as exc:
+        logging.warning("Cannot load dataset feature order from %s/meta/info.json: %s", root_path, exc)
+        return None, None
+
+    features = info.get("features", {})
+    state_names = features.get("observation.state", {}).get("names")
+    action_names = features.get("action", {}).get("names")
+
+    state_keys = [normalize_motor_feature_name(name) for name in state_names] if isinstance(state_names, list) else None
+    action_keys = [normalize_motor_feature_name(name) for name in action_names] if isinstance(action_names, list) else None
+
+    logging.info("Dataset observation.state feature order: %s", state_keys)
+    logging.info("Dataset action feature order: %s", action_keys)
+    return state_keys, action_keys
+
+
+def validate_feature_order(feature_name: str, keys: list[str] | None, available_keys: list[str]) -> list[str] | None:
+    if keys is None:
+        return None
+
+    missing = [key for key in keys if key not in available_keys]
+    if missing:
+        logging.warning(
+            "Dataset %s feature order contains keys not available on this robot: missing=%s available=%s. "
+            "Falling back to robot order.",
+            feature_name,
+            missing,
+            available_keys,
+        )
+        return None
+
+    if len(keys) != len(available_keys):
+        logging.warning(
+            "Dataset %s feature order length differs from robot keys: dataset=%s robot=%s. "
+            "Falling back to robot order.",
+            feature_name,
+            keys,
+            available_keys,
+        )
+        return None
+
+    return keys
+
+
 def parse_camera_mapping(args: argparse.Namespace) -> dict[str, int]:
     mapping: dict[str, int] = {}
     for config_str in args.camera_config:
@@ -595,6 +692,25 @@ def parse_camera_mapping(args: argparse.Namespace) -> dict[str, int]:
         for name, index in zip(args.camera_name, args.camera_index):
             mapping[name] = index
     return mapping
+
+
+def parse_camera_flips(raw_values: list[str]) -> dict[str, str]:
+    flips: dict[str, str] = {}
+    valid_modes = {"horizontal", "vertical", "both"}
+    for raw_value in raw_values:
+        if "=" not in raw_value:
+            raise ValueError("Invalid --flip-camera format. Use front=horizontal, top=vertical, or front=both.")
+        name, mode = raw_value.split("=", 1)
+        name = name.strip()
+        mode = mode.strip().lower()
+        if not name:
+            raise ValueError("Camera name cannot be empty in --flip-camera.")
+        if mode not in valid_modes:
+            raise ValueError(
+                f"Invalid flip mode '{mode}' for camera '{name}'. Valid modes: {sorted(valid_modes)}."
+            )
+        flips[name] = mode
+    return flips
 
 
 def create_robot_camera_configs(required_image_features: list[str], camera_mapping: dict[str, int], args: argparse.Namespace) -> dict[str, OpenCVCameraConfig]:
@@ -648,11 +764,32 @@ def create_robot_camera_configs(required_image_features: list[str], camera_mappi
     )
 
 
-def build_observation_frame(observation: dict[str, np.ndarray], robot: SO101Follower, policy) -> dict[str, np.ndarray]:
+def get_state_keys(robot: SO101Follower, dataset_state_keys: list[str] | None = None) -> list[str]:
+    return dataset_state_keys if dataset_state_keys is not None else list(robot.action_features)
+
+
+def apply_camera_flip(image: np.ndarray, mode: str) -> np.ndarray:
+    if mode == "horizontal":
+        return np.flip(image, axis=1).copy()
+    if mode == "vertical":
+        return np.flip(image, axis=0).copy()
+    if mode == "both":
+        return np.flip(image, axis=(0, 1)).copy()
+    raise ValueError(f"Unsupported camera flip mode: {mode}")
+
+
+def build_observation_frame(
+    observation: dict[str, np.ndarray],
+    robot: SO101Follower,
+    policy,
+    camera_flips: dict[str, str] | None = None,
+    dataset_state_keys: list[str] | None = None,
+) -> dict[str, np.ndarray]:
     frame: dict[str, np.ndarray] = {}
+    camera_flips = {} if camera_flips is None else camera_flips
 
     if "observation.state" in policy.config.input_features:
-        state_keys = list(robot.action_features)
+        state_keys = get_state_keys(robot, dataset_state_keys)
         frame["observation.state"] = np.array([observation[key] for key in state_keys], dtype=np.float32)
 
     for key in policy.config.image_features:
@@ -663,7 +800,10 @@ def build_observation_frame(observation: dict[str, np.ndarray], robot: SO101Foll
                 "Missing camera observation for feature '" + key + "'. "
                 f"Available observation keys: {list(observation.keys())}."
             )
-        frame[key] = observation[camera_name]
+        image = observation[camera_name]
+        if camera_name in camera_flips:
+            image = apply_camera_flip(image, camera_flips[camera_name])
+        frame[key] = image
 
     return frame
 
@@ -700,12 +840,13 @@ def parse_action_keys(raw_values: list[str], action_keys: list[str]) -> set[str]
 def build_action_dict(
     action_tensor: torch.Tensor,
     robot: SO101Follower,
+    dataset_action_keys: list[str] | None = None,
     action_scale: float = 1.0,
     invert_action_all: bool = False,
     invert_action_keys: set[str] | None = None,
 ) -> dict[str, float]:
     action_values = action_tensor.cpu().numpy().astype(np.float32).reshape(-1)
-    action_keys = list(robot.action_features)
+    action_keys = dataset_action_keys if dataset_action_keys is not None else list(robot.action_features)
     if len(action_values) != len(action_keys):
         raise ValueError(
             f"Expected action dimension {len(action_keys)}, but policy output has shape {action_values.shape}."
@@ -721,6 +862,52 @@ def build_action_dict(
     )
     action_values = action_values * signs * action_scale
     return {key: float(value) for key, value in zip(action_keys, action_values)}
+
+
+def tensor_to_float_list(tensor: torch.Tensor) -> list[float]:
+    return tensor.detach().cpu().numpy().astype(np.float32).reshape(-1).tolist()
+
+
+def log_policy_feature_config(policy_cfg: PreTrainedConfig) -> None:
+    logging.info("Policy config input_features: %s", policy_cfg.input_features)
+    logging.info("Policy config output_features: %s", policy_cfg.output_features)
+    logging.info("Policy config image_features: %s", policy_cfg.image_features)
+
+
+def log_robot_feature_config(robot: SO101Follower) -> None:
+    logging.info("Robot action_features: %s", robot.action_features)
+    logging.info("Robot observation_features: %s", robot.observation_features)
+
+
+def log_first_step_debug(
+    observation: dict[str, np.ndarray],
+    frame: dict[str, np.ndarray],
+    action_tensor: torch.Tensor,
+    action_dict: dict[str, float],
+    robot: SO101Follower,
+    policy,
+    dataset_state_keys: list[str] | None,
+    dataset_action_keys: list[str] | None,
+) -> None:
+    state_keys = get_state_keys(robot, dataset_state_keys)
+    logging.info("DEBUG first step observation.keys: %s", list(observation.keys()))
+    logging.info("DEBUG first step state_keys used for observation.state: %s", state_keys)
+    logging.info("DEBUG first step action_keys used for action_tensor mapping: %s", dataset_action_keys or list(robot.action_features))
+    if "observation.state" in frame:
+        logging.info("DEBUG first step observation.state values: %s", frame["observation.state"].tolist())
+    for image_key in policy.config.image_features:
+        if image_key in frame:
+            image = frame[image_key]
+            logging.info(
+                "DEBUG first step %s shape=%s dtype=%s min=%s max=%s",
+                image_key,
+                getattr(image, "shape", None),
+                getattr(image, "dtype", None),
+                np.min(image) if isinstance(image, np.ndarray) else None,
+                np.max(image) if isinstance(image, np.ndarray) else None,
+            )
+    logging.info("DEBUG first step raw action_tensor values: %s", tensor_to_float_list(action_tensor))
+    logging.info("DEBUG first step action_dict sent mapping: %s", action_dict)
 
 
 def log_state(state: RobotRunState, message: str, *args) -> None:
@@ -854,6 +1041,10 @@ def run_act_once(
     invert_action_all: bool,
     invert_action_keys: set[str],
     control_period_s: float,
+    camera_flips: dict[str, str],
+    dry_run: bool,
+    dataset_state_keys: list[str] | None,
+    dataset_action_keys: list[str] | None,
 ) -> None:
     if steps <= 0:
         raise ValueError("--steps must be greater than 0 in MCP trigger mode.")
@@ -862,24 +1053,37 @@ def run_act_once(
     log_state(RobotRunState.RUNNING, "Run %s started. task=%s steps=%s", run_index, task, steps)
     for step in range(steps):
         observation = robot.get_observation()
-        frame = build_observation_frame(observation, robot, policy)
-        action_tensor = predict_action(
-            frame,
+        frame = build_observation_frame(
+            observation,
+            robot,
             policy,
-            device,
-            use_amp,
-            task=task,
-            robot_type=robot.robot_type,
+            camera_flips=camera_flips,
+            dataset_state_keys=dataset_state_keys,
         )
+        with torch.inference_mode():
+            action_tensor = predict_action(
+                frame,
+                policy,
+                device,
+                use_amp,
+                task=task,
+                robot_type=robot.robot_type,
+            )
         action_dict = build_action_dict(
             action_tensor,
             robot,
+            dataset_action_keys=dataset_action_keys,
             action_scale=action_scale,
             invert_action_all=invert_action_all,
             invert_action_keys=invert_action_keys,
         )
-        sent_action = robot.send_action(action_dict)
-        logging.info("Run %s step %s action=%s", run_index, step, sent_action)
+        logging.info("Run %s step %s raw_action_tensor=%s", run_index, step, tensor_to_float_list(action_tensor))
+        logging.info("Run %s step %s action_dict=%s", run_index, step, action_dict)
+        if dry_run:
+            logging.info("Run %s step %s dry_run=true; action not sent to robot.", run_index, step)
+        else:
+            sent_action = robot.send_action(action_dict)
+            logging.info("Run %s step %s sent_action=%s", run_index, step, sent_action)
         sleep_control_period(control_period_s)
     log_state(RobotRunState.RUNNING, "Run %s completed.", run_index)
 
@@ -909,6 +1113,9 @@ def run_immediate_loop(
     device: torch.device,
     use_amp: bool,
     invert_action_keys: set[str],
+    camera_flips: dict[str, str],
+    dataset_state_keys: list[str] | None,
+    dataset_action_keys: list[str] | None,
 ) -> None:
     if args.steps == 0:
         logging.info("--steps 0 requested. Load check completed; skipping inference loop.")
@@ -918,7 +1125,13 @@ def run_immediate_loop(
     step = 0
     while args.run_forever or step < args.steps:
         observation = robot.get_observation()
-        frame = build_observation_frame(observation, robot, policy)
+        frame = build_observation_frame(
+            observation,
+            robot,
+            policy,
+            camera_flips=camera_flips,
+            dataset_state_keys=dataset_state_keys,
+        )
         with torch.inference_mode():
             action_tensor = predict_action(
                 frame,
@@ -931,12 +1144,29 @@ def run_immediate_loop(
         action_dict = build_action_dict(
             action_tensor,
             robot,
+            dataset_action_keys=dataset_action_keys,
             action_scale=args.action_scale,
             invert_action_all=args.invert_action_all,
             invert_action_keys=invert_action_keys,
         )
-        sent_action = robot.send_action(action_dict)
-        logging.info("Step %s action=%s", step, sent_action)
+        if args.debug_first_step and step == 0:
+            log_first_step_debug(
+                observation,
+                frame,
+                action_tensor,
+                action_dict,
+                robot,
+                policy,
+                dataset_state_keys,
+                dataset_action_keys,
+            )
+        logging.info("Step %s raw_action_tensor=%s", step, tensor_to_float_list(action_tensor))
+        logging.info("Step %s action_dict=%s", step, action_dict)
+        if args.dry_run:
+            logging.info("Step %s dry_run=true; action not sent to robot.", step)
+        else:
+            sent_action = robot.send_action(action_dict)
+            logging.info("Step %s sent_action=%s", step, sent_action)
         step += 1
         sleep_control_period(args.control_period_s)
 
@@ -949,6 +1179,9 @@ def run_mcp_trigger_loop(
     use_amp: bool,
     invert_action_keys: set[str],
     action_keys: list[str],
+    camera_flips: dict[str, str],
+    dataset_state_keys: list[str] | None,
+    dataset_action_keys: list[str] | None,
 ) -> None:
     placement_tasks = resolve_placement_tasks(args.placement_task, args.max_runs)
     home_observation = robot.get_observation()
@@ -1011,6 +1244,10 @@ def run_mcp_trigger_loop(
                 args.invert_action_all,
                 invert_action_keys,
                 args.control_period_s,
+                camera_flips,
+                args.dry_run,
+                dataset_state_keys,
+                dataset_action_keys,
             )
             drain_pending_triggers(server, RobotRunState.RUNNING)
             return_home(next_run, robot, home_action, args.return_home_steps, args.control_period_s)
@@ -1046,6 +1283,9 @@ def main() -> int:
     logging.info("  action_scale=%s", args.action_scale)
     logging.info("  invert_action_all=%s", args.invert_action_all)
     logging.info("  invert_action=%s", args.invert_action)
+    logging.info("  dry_run=%s", args.dry_run)
+    logging.info("  debug_first_step=%s", args.debug_first_step)
+    logging.info("  flip_camera=%s", args.flip_camera)
     logging.info("  steps=%s", args.steps)
     logging.info("  run_forever=%s", args.run_forever)
     logging.info("  mcp_trigger_tcp=%s", args.mcp_trigger_tcp)
@@ -1095,6 +1335,7 @@ def main() -> int:
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
     policy_cfg.device = args.device
     policy_cfg.use_amp = args.use_amp
+    log_policy_feature_config(policy_cfg)
 
     if args.use_amp and args.device != "cuda":
         logging.warning("Automatic mixed precision requested but only available on CUDA. Disabling AMP.")
@@ -1134,8 +1375,18 @@ def main() -> int:
 
     image_features = sorted(policy_cfg.image_features.keys())
     camera_mapping = parse_camera_mapping(args)
+    camera_flips = parse_camera_flips(args.flip_camera)
     cameras = create_robot_camera_configs(image_features, camera_mapping, args)
+    unknown_flip_cameras = sorted(set(camera_flips) - set(cameras))
+    if unknown_flip_cameras:
+        raise ValueError(
+            "Unknown --flip-camera name(s): "
+            + ", ".join(unknown_flip_cameras)
+            + ". Configured cameras: "
+            + ", ".join(sorted(cameras))
+        )
     logging.info("Using camera mappings: %s", {name: cfg.index_or_path for name, cfg in cameras.items()})
+    logging.info("Using camera flips: %s", camera_flips)
     for name, cfg in cameras.items():
         logging.info(
             "Camera %s: index=%s width=%s height=%s fps=%s color_mode=%s",
@@ -1156,9 +1407,33 @@ def main() -> int:
         use_degrees=args.use_degrees,
     )
     robot = SO101Follower(robot_cfg)
-    action_keys = list(robot.action_features)
+    robot_action_keys = list(robot.action_features)
+    dataset_root_for_features = resolve_dataset_root_from_config(policy_path, args.dataset_root)
+    dataset_state_keys, dataset_action_keys = load_dataset_feature_order(dataset_root_for_features)
+    dataset_state_keys = validate_feature_order(
+        "observation.state",
+        dataset_state_keys,
+        robot_action_keys,
+    )
+    dataset_action_keys = validate_feature_order("action", dataset_action_keys, robot_action_keys)
+    action_keys = dataset_action_keys if dataset_action_keys is not None else robot_action_keys
+    if dataset_state_keys is not None and dataset_state_keys != robot_action_keys:
+        logging.warning(
+            "Using dataset observation.state order because it differs from robot order: dataset=%s robot=%s",
+            dataset_state_keys,
+            robot_action_keys,
+        )
+    if dataset_action_keys is not None and dataset_action_keys != robot_action_keys:
+        logging.warning(
+            "Using dataset action order because it differs from robot order: dataset=%s robot=%s",
+            dataset_action_keys,
+            robot_action_keys,
+        )
     invert_action_keys = parse_action_keys(args.invert_action, action_keys)
-    logging.info("Robot action keys: %s", action_keys)
+    log_robot_feature_config(robot)
+    logging.info("Robot action keys: %s", robot_action_keys)
+    logging.info("State keys used for observation.state: %s", dataset_state_keys or robot_action_keys)
+    logging.info("Action keys used for action_tensor mapping: %s", action_keys)
     logging.info(
         "Action transform: scale=%s invert_all=%s invert_keys=%s",
         args.action_scale,
@@ -1187,6 +1462,9 @@ def main() -> int:
                 policy_cfg.use_amp,
                 invert_action_keys,
                 action_keys,
+                camera_flips,
+                dataset_state_keys,
+                dataset_action_keys,
             )
         else:
             run_immediate_loop(
@@ -1196,6 +1474,9 @@ def main() -> int:
                 device,
                 policy_cfg.use_amp,
                 invert_action_keys,
+                camera_flips,
+                dataset_state_keys,
+                dataset_action_keys,
             )
     except KeyboardInterrupt:
         logging.info("Interrupted by user.")

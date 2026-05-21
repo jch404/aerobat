@@ -23,11 +23,76 @@ python examples/run_act_inference_jetson_fixed.py \
   --task "stack blue box on floor 1" \
   --steps 10
 
+# Safe mapping/debug test. This runs inference but does not move the robot.
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=2 \
+  --camera-config top=0 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 5 \
+  --dry-run \
+  --debug-first-step
+
+# If the front camera looks mirrored compared with training, test this safely:
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=2 \
+  --camera-config top=0 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 5 \
+  --dry-run \
+  --debug-first-step \
+  --flip-camera front=horizontal
+
+# If shoulder pan direction is reversed, test this with a short real run:
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=2 \
+  --camera-config top=0 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 3 \
+  --invert-action shoulder_pan.pos
+
 # Expected good log:
 # INFO Found train_config.json at ...
 # INFO Loaded normalization stats from /home/user/project/lerobot/data/cjfgn/floor1_stack/meta/stats.json
 # INFO Normalization buffers look valid; no repair needed.
 # INFO All normalization buffers are finite.
+# INFO Policy config input_features: ...
+# INFO Policy config output_features: ...
+# INFO Policy config image_features: ...
+# INFO Robot action_features: ...
+# INFO Robot observation_features: ...
+# INFO DEBUG first step observation.keys: ...
+# INFO DEBUG first step state_keys used for observation.state: ...
+# INFO DEBUG first step action_keys used for action_tensor mapping: ...
+# INFO DEBUG first step raw action_tensor values: ...
+# INFO DEBUG first step action_dict sent mapping: ...
+#
+# Important:
+# If dataset feature order differs from robot order, the script now uses
+# /home/user/project/lerobot/data/cjfgn/floor1_stack/meta/info.json names.
+# Look for:
+# WARNING Using dataset observation.state order because it differs from robot order
+# WARNING Using dataset action order because it differs from robot order
 #
 # These warnings should be gone:
 # WARNING Dataset root path does not exist
