@@ -175,6 +175,11 @@ def parse_args() -> argparse.Namespace:
         help="Log detailed observation/state/action mapping information on the first inference step.",
     )
     parser.add_argument(
+        "--debug-actions",
+        action="store_true",
+        help="Log raw normalized ACT model output, unnormalized action output, action min/max, and send mapping.",
+    )
+    parser.add_argument(
         "--save-debug-images",
         action="store_true",
         help="Save the first-step camera images that are passed to the policy under /tmp/debug_<camera>.png.",
@@ -873,6 +878,108 @@ def tensor_to_float_list(tensor: torch.Tensor) -> list[float]:
     return tensor.detach().cpu().numpy().astype(np.float32).reshape(-1).tolist()
 
 
+def summarize_numeric_values(values: list[float]) -> str:
+    if not values:
+        return "empty"
+    return f"min={min(values):.6f} max={max(values):.6f}"
+
+
+def summarize_observation_value(value) -> str:
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return f"ndarray shape={value.shape} dtype={value.dtype} empty"
+        return (
+            f"ndarray shape={value.shape} dtype={value.dtype} "
+            f"min={float(np.min(value)):.6f} max={float(np.max(value)):.6f}"
+        )
+    if isinstance(value, np.generic):
+        return str(value.item())
+    return str(value)
+
+
+def log_observation_summary(observation: dict[str, np.ndarray]) -> None:
+    logging.info("Observation keys: %s", list(observation.keys()))
+    for key, value in observation.items():
+        logging.info("Observation %s=%s", key, summarize_observation_value(value))
+
+
+def prepare_policy_batch(
+    frame: dict[str, np.ndarray],
+    policy,
+    device: torch.device,
+    task: str | None,
+    robot_type: str | None,
+) -> dict[str, torch.Tensor | str]:
+    batch = {}
+    for name, value in frame.items():
+        tensor = torch.as_tensor(value.copy())
+        if "image" in name:
+            tensor = tensor.type(torch.float32) / 255
+            tensor = tensor.permute(2, 0, 1).contiguous()
+        tensor = tensor.unsqueeze(0).to(device)
+        batch[name] = tensor
+
+    batch["task"] = task if task else ""
+    batch["robot_type"] = robot_type if robot_type else ""
+    return batch
+
+
+def predict_action_chunk_debug(
+    frame: dict[str, np.ndarray],
+    policy,
+    device: torch.device,
+    use_amp: bool,
+    task: str | None,
+    robot_type: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the first raw normalized and unnormalized ACT actions without consuming the policy action queue."""
+    from contextlib import nullcontext
+
+    policy.eval()
+    with (
+        torch.inference_mode(),
+        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
+    ):
+        batch = prepare_policy_batch(frame, policy, device, task, robot_type)
+        normalized_batch = policy.normalize_inputs(batch)
+        if policy.config.image_features:
+            normalized_batch = dict(normalized_batch)
+            normalized_batch["observation.images"] = [
+                normalized_batch[key] for key in policy.config.image_features
+            ]
+
+        raw_action_chunk = policy.model(normalized_batch)[0]
+        unnormalized_action_chunk = policy.unnormalize_outputs({"action": raw_action_chunk})["action"]
+        raw_first_action = raw_action_chunk[:, 0].squeeze(0).to("cpu")
+        unnormalized_first_action = unnormalized_action_chunk[:, 0].squeeze(0).to("cpu")
+
+    return raw_first_action, unnormalized_first_action
+
+
+def log_action_debug_values(
+    step: int,
+    raw_action_tensor: torch.Tensor,
+    unnormalized_action_tensor: torch.Tensor,
+    selected_action_tensor: torch.Tensor,
+    action_dict: dict[str, float],
+    action_keys: list[str],
+) -> None:
+    raw_values = tensor_to_float_list(raw_action_tensor)
+    unnormalized_values = tensor_to_float_list(unnormalized_action_tensor)
+    selected_values = tensor_to_float_list(selected_action_tensor)
+    dict_values = list(action_dict.values())
+
+    logging.info("Step %s action key order: %s", step, action_keys)
+    logging.info("Step %s raw normalized ACT action=%s", step, raw_values)
+    logging.info("Step %s raw normalized ACT action %s", step, summarize_numeric_values(raw_values))
+    logging.info("Step %s unnormalized ACT action=%s", step, unnormalized_values)
+    logging.info("Step %s unnormalized ACT action %s", step, summarize_numeric_values(unnormalized_values))
+    logging.info("Step %s selected policy action=%s", step, selected_values)
+    logging.info("Step %s selected policy action %s", step, summarize_numeric_values(selected_values))
+    logging.info("Step %s robot.send_action action_dict=%s", step, action_dict)
+    logging.info("Step %s robot.send_action action_dict %s", step, summarize_numeric_values(dict_values))
+
+
 def log_policy_feature_config(policy_cfg: PreTrainedConfig) -> None:
     logging.info("Policy config input_features: %s", policy_cfg.input_features)
     logging.info("Policy config output_features: %s", policy_cfg.output_features)
@@ -1082,6 +1189,7 @@ def run_act_once(
     camera_flips: dict[str, str],
     dry_run: bool,
     save_debug_images_enabled: bool,
+    debug_actions: bool,
     dataset_state_keys: list[str] | None,
     dataset_action_keys: list[str] | None,
 ) -> None:
@@ -1092,6 +1200,8 @@ def run_act_once(
     log_state(RobotRunState.RUNNING, "Run %s started. task=%s steps=%s", run_index, task, steps)
     for step in range(steps):
         observation = robot.get_observation()
+        if debug_actions:
+            log_observation_summary(observation)
         frame = build_observation_frame(
             observation,
             robot,
@@ -1101,6 +1211,17 @@ def run_act_once(
         )
         if save_debug_images_enabled and step == 0:
             save_debug_images(frame, policy)
+        debug_raw_action = None
+        debug_unnormalized_action = None
+        if debug_actions:
+            debug_raw_action, debug_unnormalized_action = predict_action_chunk_debug(
+                frame,
+                policy,
+                device,
+                use_amp,
+                task,
+                robot.robot_type,
+            )
         with torch.inference_mode():
             action_tensor = predict_action(
                 frame,
@@ -1118,6 +1239,16 @@ def run_act_once(
             invert_action_all=invert_action_all,
             invert_action_keys=invert_action_keys,
         )
+        action_keys = dataset_action_keys if dataset_action_keys is not None else list(robot.action_features)
+        if debug_actions and debug_raw_action is not None and debug_unnormalized_action is not None:
+            log_action_debug_values(
+                step,
+                debug_raw_action,
+                debug_unnormalized_action,
+                action_tensor,
+                action_dict,
+                action_keys,
+            )
         logging.info("Run %s step %s raw_action_tensor=%s", run_index, step, tensor_to_float_list(action_tensor))
         logging.info("Run %s step %s action_dict=%s", run_index, step, action_dict)
         if dry_run:
@@ -1166,6 +1297,8 @@ def run_immediate_loop(
     step = 0
     while args.run_forever or step < args.steps:
         observation = robot.get_observation()
+        if args.debug_actions:
+            log_observation_summary(observation)
         frame = build_observation_frame(
             observation,
             robot,
@@ -1175,6 +1308,17 @@ def run_immediate_loop(
         )
         if args.save_debug_images and step == 0:
             save_debug_images(frame, policy)
+        debug_raw_action = None
+        debug_unnormalized_action = None
+        if args.debug_actions:
+            debug_raw_action, debug_unnormalized_action = predict_action_chunk_debug(
+                frame,
+                policy,
+                device,
+                use_amp,
+                args.task,
+                robot.robot_type,
+            )
         with torch.inference_mode():
             action_tensor = predict_action(
                 frame,
@@ -1202,6 +1346,16 @@ def run_immediate_loop(
                 policy,
                 dataset_state_keys,
                 dataset_action_keys,
+            )
+        action_keys = dataset_action_keys if dataset_action_keys is not None else list(robot.action_features)
+        if args.debug_actions and debug_raw_action is not None and debug_unnormalized_action is not None:
+            log_action_debug_values(
+                step,
+                debug_raw_action,
+                debug_unnormalized_action,
+                action_tensor,
+                action_dict,
+                action_keys,
             )
         logging.info("Step %s raw_action_tensor=%s", step, tensor_to_float_list(action_tensor))
         logging.info("Step %s action_dict=%s", step, action_dict)
@@ -1290,6 +1444,7 @@ def run_mcp_trigger_loop(
                 camera_flips,
                 args.dry_run,
                 args.save_debug_images,
+                args.debug_actions,
                 dataset_state_keys,
                 dataset_action_keys,
             )
@@ -1329,6 +1484,7 @@ def main() -> int:
     logging.info("  invert_action=%s", args.invert_action)
     logging.info("  dry_run=%s", args.dry_run)
     logging.info("  debug_first_step=%s", args.debug_first_step)
+    logging.info("  debug_actions=%s", args.debug_actions)
     logging.info("  save_debug_images=%s", args.save_debug_images)
     logging.info("  flip_camera=%s", args.flip_camera)
     logging.info("  steps=%s", args.steps)
@@ -1353,6 +1509,11 @@ def main() -> int:
         raise ValueError("--return-home-steps must be 0 or greater.")
     if args.control_period_s < 0:
         raise ValueError("--control-period-s must be 0 or greater.")
+    if args.debug_actions and args.steps > 1:
+        logging.info(
+            "--debug-actions recomputes the first ACT action chunk for inspection each step. "
+            "Use --steps 1 for the cleanest raw-vs-unnormalized comparison."
+        )
 
     if args.detect_cameras:
         available = detect_connected_cameras()
