@@ -1,28 +1,4 @@
-﻿현재 목표
-- Jetson Orin Nano에서 ACT 모델이 단독으로 정상 적재 동작을 하는지 확인한다.
-- MCP 연동은 제외한다.
-- MCP는 ACT 모델 단독 검증이 끝난 뒤 붙인다.
-
-중요 판단
-- examples/run_act_inference_jetson_fixed.py는 지금 검증에 사용하지 않는다.
-- 해당 파일은 공식 LeRobot 평가 방식이 아니라 custom inference 코드다.
-- normalization stats를 못 불러오면 identity stats로 대체할 수 있고, action-scale / invert / return_home 같은 임의 변환이 들어가 ACT 모델 성능 검증에 부적절하다.
-- 공식 문서와 영상 기준으로 ACT 평가는 lerobot-record + --policy.path 방식으로 먼저 확인한다.
-
-기존 로그에서 확인된 문제
-- Dataset normalization stats were not loaded
-- Missing normalization keys
-- action 값이 0.1, 0.03 수준으로 너무 작게 나옴
-- 로봇이 정상 적재 방향으로 움직이지 못함
-
-Jetson 메모리 주의
-- Jetson에서 메모리가 부족하면 자세한 오류 없이 "죽었음"만 뜰 수 있다.
-- 그래서 display, video, streaming encoding을 끄고 num_episodes=1로 최소 실행한다.
-- 터미널 하나만 사용한다.
-- 이미 (lerobot) 환경이고 /home/user/project/lerobot 위치라면 cd와 conda activate는 생략 가능하다.
-
-실행 명령
-export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
+(lerobot) user@ubuntu:~/project/lerobot$ ﻿export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -42,29 +18,7 @@ lerobot-record \
   --dataset.push_to_hub=false \
   --dataset.video=false \
   --dataset.streaming_encoding=false \
-  --policy.path=/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
-  --policy.device=cuda
+  --policy.path=/home/user/project/lerobot/outputs/train/act_floor1_stack/checkp  --policy.device=cudad_model \
+bash: ﻿export: 명령어를 찾을 수 없음
+bash: lerobot-record: 명령어를 찾을 수 없음
 
-확인할 항목
-1. 공식 lerobot-record 방식으로 실행이 시작되는지
-2. Jetson에서 메모리 부족으로 죽는지
-3. normalization stats가 정상 로드되는지
-4. Missing normalization keys 경고가 사라졌는지
-5. action 값이 기존 0.1, 0.03 수준보다 정상 범위로 나오는지
-6. 로봇팔이 적재 방향으로 움직이는지
-7. 이 방식으로 정상 작동하면 기존 custom inference 코드는 폐기하거나 나중에 MCP 붙일 때만 참고한다.
-
-실패 시 전달할 로그
-- 실행한 전체 명령
-- 터미널 출력 전체
-- "죽었음"이 나온 시점
-- normalization 관련 경고 문구
-- CUDA 또는 memory 관련 문구
-- 카메라 인식 실패 문구
-- 로봇 포트 / 연결 실패 문구
-- 로봇팔이 실제로 어떻게 움직였는지 짧은 설명
-
-다음 판단 기준
-- lerobot-record에서 정상 동작하면 ACT 모델과 normalization은 정상으로 보고, MCP는 이후 단계에서 붙인다.
-- lerobot-record에서도 action이 너무 작거나 방향이 이상하면 dataset stats, policy checkpoint, camera mapping, task string 순서로 다시 확인한다.
-- lerobot-record가 메모리 부족으로 죽으면 해상도/FPS 축소, 카메라 1개 실행, CPU/GPU 메모리 사용량 확인 순서로 줄인다.
