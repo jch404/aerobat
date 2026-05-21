@@ -175,6 +175,11 @@ def parse_args() -> argparse.Namespace:
         help="Log detailed observation/state/action mapping information on the first inference step.",
     )
     parser.add_argument(
+        "--save-debug-images",
+        action="store_true",
+        help="Save the first-step camera images that are passed to the policy under /tmp/debug_<camera>.png.",
+    )
+    parser.add_argument(
         "--flip-camera",
         action="append",
         default=[],
@@ -910,6 +915,39 @@ def log_first_step_debug(
     logging.info("DEBUG first step action_dict sent mapping: %s", action_dict)
 
 
+def save_debug_images(frame: dict[str, np.ndarray], policy) -> None:
+    if cv2 is None:
+        logging.warning("--save-debug-images requested but OpenCV is not installed; images were not saved.")
+        return
+
+    for image_key in policy.config.image_features:
+        if image_key not in frame:
+            continue
+        if not image_key.startswith("observation.images."):
+            logging.warning("Skipping unsupported debug image key: %s", image_key)
+            continue
+
+        camera_name = image_key.removeprefix("observation.images.")
+        image = frame[image_key]
+        if not isinstance(image, np.ndarray):
+            logging.warning("Skipping debug image %s because it is not a numpy array.", image_key)
+            continue
+
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+
+        if image.ndim == 3 and image.shape[2] == 3:
+            image_to_save = cv2.cvtColor(np.ascontiguousarray(image), cv2.COLOR_RGB2BGR)
+        else:
+            image_to_save = np.ascontiguousarray(image)
+
+        output_path = Path("/tmp") / f"debug_{camera_name}.png"
+        if not cv2.imwrite(str(output_path), image_to_save):
+            logging.warning("Failed to save debug image: %s", output_path)
+            continue
+        logging.info("Saved debug image: %s", output_path)
+
+
 def log_state(state: RobotRunState, message: str, *args) -> None:
     logging.info("[%s] " + message, state.value, *args)
 
@@ -1043,6 +1081,7 @@ def run_act_once(
     control_period_s: float,
     camera_flips: dict[str, str],
     dry_run: bool,
+    save_debug_images_enabled: bool,
     dataset_state_keys: list[str] | None,
     dataset_action_keys: list[str] | None,
 ) -> None:
@@ -1060,6 +1099,8 @@ def run_act_once(
             camera_flips=camera_flips,
             dataset_state_keys=dataset_state_keys,
         )
+        if save_debug_images_enabled and step == 0:
+            save_debug_images(frame, policy)
         with torch.inference_mode():
             action_tensor = predict_action(
                 frame,
@@ -1132,6 +1173,8 @@ def run_immediate_loop(
             camera_flips=camera_flips,
             dataset_state_keys=dataset_state_keys,
         )
+        if args.save_debug_images and step == 0:
+            save_debug_images(frame, policy)
         with torch.inference_mode():
             action_tensor = predict_action(
                 frame,
@@ -1246,6 +1289,7 @@ def run_mcp_trigger_loop(
                 args.control_period_s,
                 camera_flips,
                 args.dry_run,
+                args.save_debug_images,
                 dataset_state_keys,
                 dataset_action_keys,
             )
@@ -1285,6 +1329,7 @@ def main() -> int:
     logging.info("  invert_action=%s", args.invert_action)
     logging.info("  dry_run=%s", args.dry_run)
     logging.info("  debug_first_step=%s", args.debug_first_step)
+    logging.info("  save_debug_images=%s", args.save_debug_images)
     logging.info("  flip_camera=%s", args.flip_camera)
     logging.info("  steps=%s", args.steps)
     logging.info("  run_forever=%s", args.run_forever)

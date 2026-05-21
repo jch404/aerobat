@@ -39,6 +39,26 @@ python examples/run_act_inference_jetson_fixed.py \
   --dry-run \
   --debug-first-step
 
+# Save the exact first-step images passed to ACT policy.
+# Outputs:
+#   /tmp/debug_front.png
+#   /tmp/debug_top.png
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=2 \
+  --camera-config top=0 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 1 \
+  --dry-run \
+  --debug-first-step \
+  --save-debug-images
+
 # If the front camera looks mirrored compared with training, test this safely:
 python examples/run_act_inference_jetson_fixed.py \
   --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
@@ -86,6 +106,8 @@ python examples/run_act_inference_jetson_fixed.py \
 # INFO DEBUG first step action_keys used for action_tensor mapping: ...
 # INFO DEBUG first step raw action_tensor values: ...
 # INFO DEBUG first step action_dict sent mapping: ...
+# INFO Saved debug image: /tmp/debug_front.png
+# INFO Saved debug image: /tmp/debug_top.png
 #
 # Important:
 # If dataset feature order differs from robot order, the script now uses
