@@ -364,13 +364,13 @@ def load_dataset_stats_from_root(dataset_root: str | None) -> dict | None:
 
     stats = load_stats(root_path)
     if stats is not None:
-        logging.info("Loaded normalization stats from %s/meta/stats.json", root_path)
+        logging.info("Loaded normalization stats from %s", root_path / STATS_PATH)
         return stats
 
     try:
         episodes_stats = load_episodes_stats(root_path)
         stats = aggregate_stats(list(episodes_stats.values()))
-        logging.info("Loaded normalization stats by aggregating %s/meta/episodes_stats.jsonl", root_path)
+        logging.info("Loaded normalization stats by aggregating %s", root_path / EPISODES_STATS_PATH)
         return stats
     except Exception as exc:
         logging.warning("Failed to load aggregate stats from dataset root %s: %s", root_path, exc)

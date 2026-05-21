@@ -6,6 +6,10 @@ export NUMEXPR_NUM_THREADS=1
 export CUDA_MODULE_LOADING=LAZY
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
+# Dataset stats path check:
+ls /home/user/project/lerobot/data/cjfgn/floor1_stack/meta
+
+# ACT lightweight inference test:
 python examples/run_act_inference_jetson_fixed.py \
   --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
   --robot-port /dev/ttyACM0 \
@@ -17,20 +21,19 @@ python examples/run_act_inference_jetson_fixed.py \
   --camera-fps 30 \
   --device cuda \
   --task "stack blue box on floor 1" \
-  --steps 0
+  --steps 10
 
-# If --steps 0 loads successfully, run a short real inference test:
+# Expected good log:
+# INFO Found train_config.json at ...
+# INFO Loaded normalization stats from /home/user/project/lerobot/data/cjfgn/floor1_stack/meta/stats.json
+# INFO Normalization buffers look valid; no repair needed.
+# INFO All normalization buffers are finite.
 #
-# python examples/run_act_inference_jetson_fixed.py \
-#   --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
-#   --robot-port /dev/ttyACM0 \
-#   --robot-id my_follower \
-#   --camera-config front=2 \
-#   --camera-config top=0 \
-#   --camera-width 640 \
-#   --camera-height 480 \
-#   --camera-fps 30 \
-#   --device cuda \
-#   --task "stack blue box on floor 1" \
-#   --steps 3 \
-#   --control-period-s 0.05
+# These warnings should be gone:
+# WARNING Dataset root path does not exist
+# WARNING Dataset normalization stats were not loaded
+#
+# Note:
+# WARNING Missing key(s) when loading model can still appear if the checkpoint
+# does not store normalizer buffers. If stats are loaded and buffers are finite,
+# this warning may be harmless for inference.
