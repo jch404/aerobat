@@ -1,47 +1,36 @@
-﻿`죽었음`만 뜨고 파이썬 에러가 없으면 **코드 문법 문제가 아니라 메모리 부족으로 OS가 강제 종료한 것**일 가능성이 큼.
+export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export CUDA_MODULE_LOADING=LAZY
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-확인:
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=2 \
+  --camera-config top=0 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 0
 
-```bash
-dmesg | tail -50
-```
-
-여기서 `Out of memory`, `Killed process`, `python` 나오면 확정.
-
-지금 바로 할 것:
-
-```bash
-free -h
-```
-
-그리고 불필요한 창 다 닫아. 브라우저, 텍스트편집기, VSCode 다 닫기.
-
-그다음 더 가볍게 CPU로 먼저 테스트:
-
-```bash
-python -m lerobot.record \
-  --robot.type=so101_follower \
-  --robot.port=/dev/ttyACM0 \
-  --robot.id=my_follower \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
-  --display_data=false \
-  --dataset.repo_id=data/eval_floor1_stack \
-  --dataset.num_episodes=1 \
-  --dataset.episode_time_s=10 \
-  --dataset.reset_time_s=3 \
-  --dataset.single_task="stack blue box on floor 1" \
-  --dataset.push_to_hub=false \
-  --dataset.video=false \
-  --dataset.streaming_encoding=false \
-  --policy.path=/home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
-  --policy.device=cpu
-```
-
-핵심 변경:
-
-```bash
---policy.device=cpu
---dataset.episode_time_s=10
-```
-
-CPU로도 죽으면 `lerobot.record` 자체가 젯슨에서 너무 무거운 거고, 우리가 만든 `run_act_inference_jetson_fixed.py` 같은 **경량 추론 코드로 실행해야 함**.
+# If --steps 0 loads successfully, run a short real inference test:
+#
+# python examples/run_act_inference_jetson_fixed.py \
+#   --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
+#   --robot-port /dev/ttyACM0 \
+#   --robot-id my_follower \
+#   --camera-config front=2 \
+#   --camera-config top=0 \
+#   --camera-width 640 \
+#   --camera-height 480 \
+#   --camera-fps 30 \
+#   --device cuda \
+#   --task "stack blue box on floor 1" \
+#   --steps 3 \
+#   --control-period-s 0.05

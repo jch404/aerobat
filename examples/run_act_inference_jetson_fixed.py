@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -27,6 +28,8 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
 import numpy as np
 import torch
@@ -165,8 +168,13 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help=(
             "Number of ACT control steps for one triggered stacking run. "
-            "In immediate mode, use 0 to run until interrupted."
+            "In immediate mode, use 0 to load policy/cameras/robot, then exit without inference."
         ),
+    )
+    parser.add_argument(
+        "--run-forever",
+        action="store_true",
+        help="Run immediate ACT inference until interrupted. This replaces the old --steps 0 forever behavior.",
     )
     parser.add_argument(
         "--mcp-trigger-tcp",
@@ -255,6 +263,31 @@ def detect_connected_cameras(max_index: int = DEFAULT_CAMERA_DETECT_MAX_INDEX) -
         if opened:
             available.append(index)
     return available
+
+
+def log_memory_status(label: str) -> None:
+    """Log lightweight process/GPU memory information when available."""
+    try:
+        import resource
+
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        logging.info("Memory %s: process_peak_rss=%.1f MiB", label, peak_mb)
+    except Exception:
+        logging.debug("Unable to read process memory status", exc_info=True)
+
+    if torch.cuda.is_available():
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            logging.info(
+                "CUDA memory %s: free=%.1f MiB total=%.1f MiB allocated=%.1f MiB reserved=%.1f MiB",
+                label,
+                free_bytes / 1024 / 1024,
+                total_bytes / 1024 / 1024,
+                torch.cuda.memory_allocated() / 1024 / 1024,
+                torch.cuda.memory_reserved() / 1024 / 1024,
+            )
+        except Exception:
+            logging.debug("Unable to read CUDA memory status", exc_info=True)
 
 
 def validate_paths(policy_path: Path, robot_port: str) -> None:
@@ -877,19 +910,24 @@ def run_immediate_loop(
     use_amp: bool,
     invert_action_keys: set[str],
 ) -> None:
+    if args.steps == 0:
+        logging.info("--steps 0 requested. Load check completed; skipping inference loop.")
+        return
+
     logging.info("Robot connected. Starting immediate inference loop.")
     step = 0
-    while args.steps == 0 or step < args.steps:
+    while args.run_forever or step < args.steps:
         observation = robot.get_observation()
         frame = build_observation_frame(observation, robot, policy)
-        action_tensor = predict_action(
-            frame,
-            policy,
-            device,
-            use_amp,
-            task=args.task,
-            robot_type=robot.robot_type,
-        )
+        with torch.inference_mode():
+            action_tensor = predict_action(
+                frame,
+                policy,
+                device,
+                use_amp,
+                task=args.task,
+                robot_type=robot.robot_type,
+            )
         action_dict = build_action_dict(
             action_tensor,
             robot,
@@ -1009,6 +1047,7 @@ def main() -> int:
     logging.info("  invert_action_all=%s", args.invert_action_all)
     logging.info("  invert_action=%s", args.invert_action)
     logging.info("  steps=%s", args.steps)
+    logging.info("  run_forever=%s", args.run_forever)
     logging.info("  mcp_trigger_tcp=%s", args.mcp_trigger_tcp)
     logging.info("  trigger_host=%s", args.trigger_host)
     logging.info("  trigger_port=%s", args.trigger_port)
@@ -1021,6 +1060,8 @@ def main() -> int:
 
     if args.action_scale <= 0:
         raise ValueError("--action-scale must be greater than 0.")
+    if args.steps < 0:
+        raise ValueError("--steps must be 0 or greater. Use --run-forever for continuous immediate inference.")
     if args.max_runs <= 0:
         raise ValueError("--max-runs must be greater than 0.")
     if args.return_home_steps < 0:
@@ -1043,11 +1084,12 @@ def main() -> int:
 
     logging.info("CUDA available: %s", torch.cuda.is_available())
     logging.info("Requested device: %s", args.device)
+    log_memory_status("before policy load")
 
     device = get_safe_torch_device(args.device, log=True)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
 
     policy_path = Path(args.policy_path)
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
@@ -1069,6 +1111,12 @@ def main() -> int:
 
     policy_cls = get_policy_class(policy_cfg.type)
     policy = policy_cls.from_pretrained(policy_path, config=policy_cfg, dataset_stats=dataset_stats)
+    policy.eval()
+    del dataset_stats
+    gc.collect()
+    if args.device == "cuda":
+        torch.cuda.empty_cache()
+    log_memory_status("after policy load")
 
     # Important fallback for old/incompatible checkpoints:
     # Even when dataset_stats is provided, some LeRobot versions keep missing
@@ -1119,6 +1167,7 @@ def main() -> int:
     )
 
     logging.info("Connecting robot on port %s", args.robot_port)
+    log_memory_status("before robot connect")
     try:
         robot.connect()
     except Exception:
@@ -1126,6 +1175,7 @@ def main() -> int:
         raise
 
     logging.info("Robot connected.")
+    log_memory_status("after robot connect")
 
     try:
         if args.mcp_trigger_tcp:
