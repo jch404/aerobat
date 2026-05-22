@@ -1,6 +1,3 @@
-cd /home/user/project/lerobot
-conda activate lerobot
-
 export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -9,8 +6,49 @@ export NUMEXPR_NUM_THREADS=1
 export CUDA_MODULE_LOADING=LAZY
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
+# Current dataset stats path check:
+ls /home/user/project/lerobot/data/cjfgn/floor1_stack/meta
+
+# 1) Safest full debug: no robot movement, saves exact policy input images.
 python examples/run_act_inference_jetson_fixed.py \
-  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack/checkpoints/080000/pretrained_model \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=0 \
+  --camera-config top=2 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 1 \
+  --dry-run \
+  --debug-first-step \
+  --debug-actions \
+  --save-debug-images
+
+# Outputs to compare with training data:
+#   /tmp/debug_front.png
+#   /tmp/debug_top.png
+
+# 2) Shoulder pan axis direction test. Short real run.
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=0 \
+  --camera-config top=2 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 10 \
+  --invert-action shoulder_pan.pos
+
+# 3) Camera mapping swap test. Use only after saving/debugging current images.
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
   --robot-port /dev/ttyACM0 \
   --robot-id my_follower \
   --camera-config front=2 \
@@ -20,7 +58,71 @@ python examples/run_act_inference_jetson_fixed.py \
   --camera-fps 30 \
   --device cuda \
   --task "stack blue box on floor 1" \
+  --steps 10
+
+# 4) Safe image orientation tests. These do not move the robot.
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=0 \
+  --camera-config top=2 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
   --steps 1 \
   --dry-run \
   --debug-first-step \
-  --debug-actions
+  --debug-actions \
+  --save-debug-images \
+  --flip-camera top=horizontal
+
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=0 \
+  --camera-config top=2 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 1 \
+  --dry-run \
+  --debug-first-step \
+  --debug-actions \
+  --save-debug-images \
+  --flip-camera top=vertical
+
+python examples/run_act_inference_jetson_fixed.py \
+  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
+  --robot-port /dev/ttyACM0 \
+  --robot-id my_follower \
+  --camera-config front=0 \
+  --camera-config top=2 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --device cuda \
+  --task "stack blue box on floor 1" \
+  --steps 1 \
+  --dry-run \
+  --debug-first-step \
+  --debug-actions \
+  --save-debug-images \
+  --flip-camera top=both
+
+# Logs to check:
+# INFO Loaded normalization stats from /home/user/project/lerobot/data/cjfgn/floor1_stack/meta/stats.json
+# INFO Dataset observation.state feature order: [...]
+# INFO Dataset action feature order: [...]
+# INFO Action transform: scale=1.0 invert_all=False invert_keys=[]
+# INFO Step 0 action key order: [...]
+# INFO Step 0 raw normalized ACT action=...
+# INFO Step 0 unnormalized ACT action=...
+# INFO Step 0 robot.send_action action_dict=...
+# INFO Saved debug image: /tmp/debug_front.png
+# INFO Saved debug image: /tmp/debug_top.png
