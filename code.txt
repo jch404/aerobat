@@ -1,128 +1,51 @@
+네, 저 명령어 자체는 NVIDIA 젯슨 오린 나노의 Ubuntu/Linux 터미널에서 실행 가능한 형식입니다.
+
+다만 전제조건이 있습니다:
+
+1. 파일이 실제로 존재해야 함
+2. `lerobot` 가상환경이 있어야 함
+3. `SO101Follower` import 경로가 현재 LeRobot 버전과 맞아야 함
+
+즉 먼저 이 파일을 만들어야 합니다:
+
+```bash
+/home/user/project/lerobot/examples/save_so101_follower_calibration_light.py
+```
+
+그 다음 실행:
+
+```bash
+cd /home/user/project/lerobot
+conda activate lerobot
 export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
-export OMP_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export CUDA_MODULE_LOADING=LAZY
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-# Current dataset stats path check:
-ls /home/user/project/lerobot/data/cjfgn/floor1_stack/meta
+OMP_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+CUDA_VISIBLE_DEVICES="" \
+python examples/save_so101_follower_calibration_light.py \
+  --port /dev/ttyACM0 \
+  --id my_follower
+```
 
-# 1) Safest full debug: no robot movement, saves exact policy input images.
-python examples/run_act_inference_jetson_fixed.py \
-  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
-  --robot-port /dev/ttyACM0 \
-  --robot-id my_follower \
-  --camera-config front=0 \
-  --camera-config top=2 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --camera-fps 30 \
-  --device cuda \
-  --task "stack blue box on floor 1" \
-  --steps 1 \
-  --dry-run \
-  --debug-first-step \
-  --debug-actions \
-  --save-debug-images
+그리고 실행 전 꼭 확인:
 
-# Outputs to compare with training data:
-#   /tmp/debug_front.png
-#   /tmp/debug_top.png
+```bash
+ls examples/save_so101_follower_calibration_light.py
+```
 
-# 2) Shoulder pan axis direction test. Short real run.
-python examples/run_act_inference_jetson_fixed.py \
-  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
-  --robot-port /dev/ttyACM0 \
-  --robot-id my_follower \
-  --camera-config front=0 \
-  --camera-config top=2 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --camera-fps 30 \
-  --device cuda \
-  --task "stack blue box on floor 1" \
-  --steps 10 \
-  --invert-action shoulder_pan.pos
+이 파일이 보여야 합니다.
 
-# 3) Camera mapping swap test. Use only after saving/debugging current images.
-python examples/run_act_inference_jetson_fixed.py \
-  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
-  --robot-port /dev/ttyACM0 \
-  --robot-id my_follower \
-  --camera-config front=2 \
-  --camera-config top=0 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --camera-fps 30 \
-  --device cuda \
-  --task "stack blue box on floor 1" \
-  --steps 10
+또 `/dev/ttyACM0` 확인:
 
-# 4) Safe image orientation tests. These do not move the robot.
-python examples/run_act_inference_jetson_fixed.py \
-  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
-  --robot-port /dev/ttyACM0 \
-  --robot-id my_follower \
-  --camera-config front=0 \
-  --camera-config top=2 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --camera-fps 30 \
-  --device cuda \
-  --task "stack blue box on floor 1" \
-  --steps 1 \
-  --dry-run \
-  --debug-first-step \
-  --debug-actions \
-  --save-debug-images \
-  --flip-camera top=horizontal
+```bash
+ls /dev/ttyACM*
+```
 
-python examples/run_act_inference_jetson_fixed.py \
-  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
-  --robot-port /dev/ttyACM0 \
-  --robot-id my_follower \
-  --camera-config front=0 \
-  --camera-config top=2 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --camera-fps 30 \
-  --device cuda \
-  --task "stack blue box on floor 1" \
-  --steps 1 \
-  --dry-run \
-  --debug-first-step \
-  --debug-actions \
-  --save-debug-images \
-  --flip-camera top=vertical
+만약 포트가 `/dev/ttyACM1` 로 바뀌었으면 명령어도 수정해야 합니다.
 
-python examples/run_act_inference_jetson_fixed.py \
-  --policy-path /home/user/project/lerobot/outputs/train/act_floor1_stack_finetune_v2/checkpoints/010000/pretrained_model \
-  --robot-port /dev/ttyACM0 \
-  --robot-id my_follower \
-  --camera-config front=0 \
-  --camera-config top=2 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --camera-fps 30 \
-  --device cuda \
-  --task "stack blue box on floor 1" \
-  --steps 1 \
-  --dry-run \
-  --debug-first-step \
-  --debug-actions \
-  --save-debug-images \
-  --flip-camera top=both
+즉 결론:
 
-# Logs to check:
-# INFO Loaded normalization stats from /home/user/project/lerobot/data/cjfgn/floor1_stack/meta/stats.json
-# INFO Dataset observation.state feature order: [...]
-# INFO Dataset action feature order: [...]
-# INFO Action transform: scale=1.0 invert_all=False invert_keys=[]
-# INFO Step 0 action key order: [...]
-# INFO Step 0 raw normalized ACT action=...
-# INFO Step 0 unnormalized ACT action=...
-# INFO Step 0 robot.send_action action_dict=...
-# INFO Saved debug image: /tmp/debug_front.png
-# INFO Saved debug image: /tmp/debug_top.png
+* 명령어 형식 자체는 젯슨에서 정상
+* 하지만 먼저 `save_so101_follower_calibration_light.py` 파일을 생성해야 실행됩니다.
