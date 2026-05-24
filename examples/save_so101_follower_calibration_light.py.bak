@@ -126,6 +126,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-#     if "torch" in sys.modules:
-#         raise RuntimeError("torch was imported unexpectedly; this script must stay lightweight.")
+    if "torch" in sys.modules:
+        raise RuntimeError("torch was imported unexpectedly; this script must stay lightweight.")
     raise SystemExit(main())
