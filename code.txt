@@ -49,3 +49,9 @@ ls /dev/ttyACM*
 
 * 명령어 형식 자체는 젯슨에서 정상
 * 하지만 먼저 `save_so101_follower_calibration_light.py` 파일을 생성해야 실행됩니다.
+
+
+cd /home/user/project/lerobot
+conda activate lerobot
+export PYTHONPATH=/home/user/project/lerobot/src:$PYTHONPATH
+python teleoperate_so101_jetson.py
